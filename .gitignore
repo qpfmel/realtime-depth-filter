@@ -1,0 +1,5 @@
+build/
+*.onnx
+.vscode
+thumbs.db
+desktop.ini
