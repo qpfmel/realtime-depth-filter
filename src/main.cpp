@@ -2,9 +2,30 @@
 #include <vector>
 #include <opencv2/opencv.hpp>
 #include <chrono>
+#include <onnxruntime_cxx_api.h>
 
 int main(){
     std::cout << "OpenCV version: " << CV_VERSION << std::endl; // OpenCV 버전 출력
+
+    std::cout << "ORT providers:";
+    for (const std::string& p : Ort::GetAvailableProviders()) {    //문자열 여러개가 담긴 vector
+        std::cout << " " << p;
+    }
+    std::cout << std::endl;
+
+    try {
+        Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "depth_filter");    // 전체 초기화
+        Ort::SessionOptions options;    // 설정상자
+        OrtCUDAProviderOptions cuda_options; // CUDA설정, 기본생성자가 기본값을 채워줌
+        options.AppendExecutionProvider_CUDA(cuda_options); // CUDA 우선순위 등록
+
+        Ort::Session session(env, L"models/depth_anything_v2_small.onnx", options); //모델 읽기&실행준비
+        std::cout << "CUDA session created" << std::endl;
+    }   
+    catch (const Ort::Exception& e) { //try catch로 실패시 원인을 파악하기 위해 사용
+        std::cerr << "ORT error: " << e.what() << std::endl;
+        return 1;
+    }
 
     std::vector<int> params = {
         cv::CAP_PROP_FOURCC,    cv::VideoWriter::fourcc('Y', 'U', 'Y', '2'),
