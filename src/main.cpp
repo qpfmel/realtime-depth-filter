@@ -21,6 +21,50 @@ int main(){
 
         Ort::Session session(env, L"models/depth_anything_v2_small.onnx", options); //모델 읽기&실행준비
         std::cout << "CUDA session created" << std::endl;
+
+        Ort::AllocatorWithDefaultOptions allocator; //ONNX Runtime의 메모리 대여창구 (이름 문자열을 담는 메모리)
+        // 입력
+        for (size_t i = 0; i < session.GetInputCount(); ++i){ //데이터를 넣을 구멍 개수 만큼 반복
+            Ort::AllocatedStringPtr name = session.GetInputNameAllocated(i, allocator); // i번째 입력 구멍의 이름 확인
+            //   =unique_ptr : name이 사라질때 메모리 이름 자동 반납(누수x 현대 c++의 메모리 자동관리)
+            Ort::TypeInfo type_info = session.GetInputTypeInfo(i); // i번째 입력에 들어가는 데이터의 종류 정보 묶음을 받음
+            auto tensor_info = type_info.GetTensorTypeAndShapeInfo(); // 종류 정보중 텐서 정보만 좁혀서 본다 (type_info보다 오래쓸경우 댕글링 발생)
+                                                                      //tensor_info는 가르키기만 하는데 type_info가 먼저 사라지면 반납된 메모리의 번호를 들고있음 그게 댕글링포인터
+
+            std::cout << "Output " << name.get();   // unique_ptr에 든 실제 글자 주소를 잠깐 꺼낸다 (소유는 여전히 name이 한다)
+            if (tensor_info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) { //데이터 타입이 float32일 경우
+                std::cout << "  type=" << "float32";
+            } 
+            else {
+               std::cout << "  type=" << tensor_info.GetElementType(); // 각 칸에 든 숫자 형식 (정수?, 소수?)
+            }
+            std::cout << "  shape=[";
+
+            for (int64_t d : tensor_info.GetShape()) {  // 몇 차원이며, 각 차원의 크기 (vector 복사본으로 반환)
+                std::cout << " " << d;
+            }
+            std::cout << " ]" << std::endl;
+        }
+        // 출력
+        for (size_t i = 0; i < session.GetOutputCount(); ++i){
+            Ort::AllocatedStringPtr name = session.GetOutputNameAllocated(i, allocator);
+            Ort::TypeInfo type_info = session.GetOutputTypeInfo(i);
+            auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+
+            std::cout << "Output " << name.get();
+            if (tensor_info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {  //데이터 타입이 float32일 경우
+                std::cout << "  type=" << "float32";
+            } 
+            else {
+                std::cout << "  type=" << tensor_info.GetElementType();
+            }
+            std::cout << "  shape=[";
+
+            for (int64_t d : tensor_info.GetShape()) {
+                std::cout << " " << d;
+            }
+            std::cout << " ]" << std::endl;
+        }
     }   
     catch (const Ort::Exception& e) { //try catch로 실패시 원인을 파악하기 위해 사용
         std::cerr << "ORT error: " << e.what() << std::endl;
