@@ -3,6 +3,8 @@
 #include <opencv2/opencv.hpp>
 #include <chrono>
 #include <onnxruntime_cxx_api.h>
+#include <opencv2/dnn.hpp>
+#include <array>
 
 int main(){
     std::cout << "OpenCV version: " << CV_VERSION << std::endl; // OpenCV 버전 출력
@@ -65,68 +67,119 @@ int main(){
             }
             std::cout << " ]" << std::endl;
         }
-    }   
+    
+
+        std::vector<int> params = {
+            cv::CAP_PROP_FOURCC,    cv::VideoWriter::fourcc('Y', 'U', 'Y', '2'),
+            cv::CAP_PROP_FRAME_WIDTH, 640,
+            cv::CAP_PROP_FRAME_HEIGHT, 480,
+            cv::CAP_PROP_FPS, 30
+        };
+
+        cv::VideoCapture cap(0, cv::CAP_DSHOW, params); // 카메라 열기
+        if(!cap.isOpened()){    //카메라가 안열릴경우 카메라 종류
+            std::cerr << "Failed to open camera" << std::endl;
+            return 1;
+        }
+
+        std::cout << "Reported: " 
+                << cap.get(cv::CAP_PROP_FRAME_WIDTH) << "x"
+                << cap.get(cv::CAP_PROP_FRAME_HEIGHT) << " @ "
+                << cap.get(cv::CAP_PROP_FPS) << " fps" << std::endl;
+
+        cv::Mat frame; //이미지를 채워넣을 공간 생성
+        cap.read(frame); //frame에 이미지 채워넣기
+        if(frame.empty()){ //첫 frame이 비어져있을 경우 카메라 종료
+            std::cerr << "First frame is empty" << std::endl;
+            return 1;
+        }
+        std::cout << "Actual frame: " << frame.cols << "x" << frame.rows << std::endl;
+
+        const int kInputW = 518; //14의 배수중 웹캠 비율에 가장 유사한 숫자
+        const int kInputH = 392;
+
+        cv::Mat rgb;
+        cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);    // 색 순서를 bgr에서 rgb로(OpenCV는 bgr이지만 해당 모델은 rgb여서)
+
+        cv::Mat resized;
+        cv::resize(rgb, resized, cv::Size(kInputW, kInputH));   // 모델이 14x14 조각으로 보기때문에 14배수로 진행
+
+        cv::Mat f32;
+        resized.convertTo(f32, CV_32F, 1.0 / 255.0); // 0~1(소수)로 숫자형식 변경
+
+        cv::Mat norm = (f32 - cv::Scalar(0.485, 0.456, 0.406)) / cv::Scalar(0.229, 0.224, 0.225);
+        //학습할때 쓴 평균/표준편차로 맞춘다 (ImageNet 기준)
+
+        cv::Mat blob = cv::dnn::blobFromImage(norm); // 배치순서 바꾸기(h,w,c -> p(장수), c, h, w)
+
+        //----------추론------------
+        std::array<int64_t, 4> input_shape{1, 3, kInputH, kInputW};// 입력형식 고정(1, 3, 392, 518)
+
+        Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU); //데이터가 cpu에 있다는것을 알려줌
+
+        Ort::Value input = Ort::Value::CreateTensor<float>(
+            mem, blob.ptr<float>(), blob.total(), input_shape.data(), input_shape.size()); //텐서 생성(얕은 복사)
+
+        const char* input_names[] = {"pixel_values"};
+        const char* output_names[] = {"predicted_depth"};
+        
+        std::vector<Ort::Value> outputs = session.Run(Ort::RunOptions{nullptr}, input_names, &input, 1, output_names, 1);
+        // 실제 모델을 실행하는 코드
+        
+        std::vector<int64_t> out_shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape(); //출력 모양 읽기
+        float* depth_data = outputs[0].GetTensorMutableData<float>(); //깊이 숫자들의 시작주소 받기
+
+        cv::Mat depth(static_cast<int>(out_shape[1]), static_cast<int>(out_shape[2]), CV_32F, depth_data);
+        //위에서 받은 숫자들을 Mat로 감싸고 static_cast로 타입변환(Out_shape는 int64_t(8바이트)이고 Mat는 int(4바이트)로 받음)
+
+        double mn = 0, mx = 0;
+        cv::minMaxLoc(depth, &mn, &mx); // 변수의 주소를 넘겨서 주소에 직접적으로 값을 새겨넣게함
+        std::cout << "depth shape=[" << out_shape[0] << " " << out_shape[1] << " " << out_shape[2]
+                  << " ] min=" << mn << " max=" << mx <<std::endl;
+
+        //시각화
+        cv::Mat depth_vis;
+        cv::normalize(depth, depth_vis, 0, 255, cv::NORM_MINMAX, CV_8U); //최대, 최솟값을 0~255로 펼쳐버린다
+        cv::Mat depth_color;
+        cv::applyColorMap(depth_vis, depth_color, cv::COLORMAP_INFERNO);
+        cv::imshow("Depth", depth_color);
+
+
+        int frameCount = 0; //fps 측정용 변수
+        auto lastTime = std::chrono::steady_clock::now();   //현재 시각 가져오기
+        double fps = 0.0;
+
+        while(true){
+            cap.read(frame);
+            if(frame.empty()){
+                std::cerr << "Empty frame" << std::endl;
+                break;
+            }
+            
+            frameCount++; // empty()다음에 있어 제대로 읽힌 프레임만 셈
+            auto now = std::chrono::steady_clock::now(); 
+            double elapsed = std::chrono::duration<double>(now - lastTime).count();
+            // 시간 간격을 초단위 소수로 바꿔 단위를 빼고 숫자만 꺼내옴
+            if(elapsed >= 1.0){ //세는건 매바퀴고 경과 시간이 1초를 넘었을때 계산하고 초기화
+                fps = frameCount / elapsed; // 정수/소수 = 소수
+                frameCount = 0;
+                lastTime = now;
+            }
+
+            cv::putText(frame, cv::format("FPS: %.1F", fps), cv::Point(10, 30), //fps 표시
+                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+            cv::putText(frame, cv::format("%dx%d", frame.cols, frame.rows), cv::Point(10, 470), //해상도 표시
+                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+
+            cv::imshow("Webcam", frame);
+            if(cv::waitKey(1) == 27){ // esc 누를 경우 반복탈출
+                break;
+            }
+        }
+    }
     catch (const Ort::Exception& e) { //try catch로 실패시 원인을 파악하기 위해 사용
         std::cerr << "ORT error: " << e.what() << std::endl;
         return 1;
-    }
-
-    std::vector<int> params = {
-        cv::CAP_PROP_FOURCC,    cv::VideoWriter::fourcc('Y', 'U', 'Y', '2'),
-        cv::CAP_PROP_FRAME_WIDTH, 640,
-        cv::CAP_PROP_FRAME_HEIGHT, 480,
-        cv::CAP_PROP_FPS, 30
-    };
-
-    cv::VideoCapture cap(0, cv::CAP_DSHOW, params); // 카메라 열기
-    if(!cap.isOpened()){    //카메라가 안열릴경우 카메라 종류
-        std::cerr << "Failed to open camera" << std::endl;
-        return 1;
-    }
-
-    std::cout << "Reported: " 
-              << cap.get(cv::CAP_PROP_FRAME_WIDTH) << "x"
-              << cap.get(cv::CAP_PROP_FRAME_HEIGHT) << " @ "
-              << cap.get(cv::CAP_PROP_FPS) << " fps" << std::endl;
-
-    cv::Mat frame; //이미지를 채워넣을 공간 생성
-    cap.read(frame); //frame에 이미지 채워넣기
-    if(frame.empty()){ //첫 frame이 비어져있을 경우 카메라 종료
-        std::cerr << "First frame is empty" << std::endl;
-        return 1;
-    }
-    std::cout << "Actual frame: " << frame.cols << "x" << frame.rows << std::endl;
-
-    int frameCount = 0; //fps 측정용 변수
-    auto lastTime = std::chrono::steady_clock::now();   //현재 시각 가져오기
-    double fps = 0.0;
-
-    while(true){
-        cap.read(frame);
-        if(frame.empty()){
-            std::cerr << "Empty frame" << std::endl;
-            break;
-        }
-        
-        frameCount++; // empty()다음에 있어 제대로 읽힌 프레임만 셈
-        auto now = std::chrono::steady_clock::now(); 
-        double elapsed = std::chrono::duration<double>(now - lastTime).count();
-        // 시간 간격을 초단위 소수로 바꿔 단위를 빼고 숫자만 꺼내옴
-        if(elapsed >= 1.0){ //세는건 매바퀴고 경과 시간이 1초를 넘었을때 계산하고 초기화
-            fps = frameCount / elapsed; // 정수/소수 = 소수
-            frameCount = 0;
-            lastTime = now;
-        }
-
-        cv::putText(frame, cv::format("FPS: %.1F", fps), cv::Point(10, 30), //fps 표시
-                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-        cv::putText(frame, cv::format("%dx%d", frame.cols, frame.rows), cv::Point(10, 470), //해상도 표시
-                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-
-        cv::imshow("Webcam", frame);
-        if(cv::waitKey(1) == 27){ // esc 누를 경우 반복탈출
-            break;
-        }
     }
     return 0;
 
