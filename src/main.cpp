@@ -116,7 +116,11 @@ int main(){
         double inferSumMs = 0.0;    //1초동안 추론에 쓴 시간의 합
         double inferMs = 0.0;       //화면에 보여줄 평균 추론 시간
 
-
+        cv::Mat prevDepth;       //직전 프레임의 깊이맵
+        double jitter = 0.0;     //화면에 보여줄 흔들림 값
+        double jitterSum = 0.0;  //1초 동안의 합   
+        double jitterCentered = 0.0;
+        double jitterCenteredSum = 0.0;
  
         while(true){
 
@@ -152,28 +156,55 @@ int main(){
             cv::Mat depth(static_cast<int>(out_shape[1]), static_cast<int>(out_shape[2]), CV_32F, depth_data);
             //위에서 받은 숫자들을 Mat로 감싸고 static_cast로 타입변환(Out_shape는 int64_t(8바이트)이고 Mat는 int(4바이트)로 받음)
 
+            // =====흔들림 측정=========
+            if (!prevDepth.empty()) {
+                cv::Mat diff;
+                cv::absdiff(depth, prevDepth, diff); //픽셀마다 |(이번) - (직전)|(절댓값)을 구해 diff에 넣음
+                jitterSum += cv::mean(diff)[0];      //전체 픽셀의 평균
+
+
+                cv::Mat a = depth - cv::Scalar(cv::mean(depth)[0]);    //프레임마다 자기 평균을 빼기
+                cv::Mat b = prevDepth - cv::Scalar(cv::mean(prevDepth)[0]);
+
+                cv::absdiff(a, b, diff);                     //픽셀마다 |(이번-이번평균) - (직전 - 직전평균)|(절댓값)을 구해 diff에 넣음
+                jitterCenteredSum += cv::mean(diff)[0];      //전체 픽셀의 평균
+            }
+            prevDepth = depth.clone(); //depth는 ONNX Runtime의 출력 메모리를 가르켜줄뿐이라 clone()을 해서 완전히 값을 복사해야한다
+            
+
             //시각화
             cv::Mat depth_vis;
             cv::normalize(depth, depth_vis, 0, 255, cv::NORM_MINMAX, CV_8U); //최대, 최솟값을 0~255로 펼쳐버린다
             cv::Mat depth_color;
             cv::applyColorMap(depth_vis, depth_color, cv::COLORMAP_INFERNO);
 
-            // double mn = 0, mx = 0;
-            // cv::minMaxLoc(depth, &mn, &mx); // 변수의 주소를 넘겨서 주소에 직접적으로 값을 새겨넣게함
-            // std::cout << "depth shape=[" << out_shape[0] << " " << out_shape[1] << " " << out_shape[2]
-            //         << " ] min=" << mn << " max=" << mx <<std::endl;
-            
-            
+            double mn = 0, mx = 0;
+            cv::minMaxLoc(depth, &mn, &mx); // 변수의 주소를 넘겨서 주소에 직접적으로 값을 새겨넣게함
+
+            std::cout << "depth shape=[" << out_shape[0] << " " << out_shape[1] << " " << out_shape[2] //min, max 값 표시
+                    << " ] min=" << mn << " max=" << mx <<std::endl;
+
+
             frameCount++; // empty()다음에 있어 제대로 읽힌 프레임만 셈
             auto now = std::chrono::steady_clock::now(); 
             double elapsed = std::chrono::duration<double>(now - lastTime).count();
             // 시간 간격을 초단위 소수로 바꿔 단위를 빼고 숫자만 꺼내옴
-            if(elapsed >= 1.0){ //세는건 매바퀴고 경과 시간이 1초를 넘었을때 계산하고 초기화
+            if(elapsed >= 1.0){  //세는건 매바퀴고 경과 시간이 1초를 넘었을때 계산하고 초기화
                 fps = frameCount / elapsed; // 정수/소수 = 소수
-                inferMs = inferSumMs / frameCount; //frameCount가 0이 되기전에 계산
+                
+                inferMs = inferSumMs / frameCount;  //frameCount가 0이 되기전에 계산
+                jitter = jitterSum / frameCount;    
+                jitterCentered = jitterCenteredSum / frameCount;
+
+                std::cout << cv::format("fps=%.1f  infer=%.1fms  J=%.4f  Jc=%.4f  d=%.2f~%.2f", //fps, infer, j, jc, d 값 표시
+                                    fps, inferMs, jitter, jitterCentered, mn, mx) << std::endl;
+                
+                jitterCenteredSum = 0.0;
+                jitterSum = 0.0;
                 frameCount = 0;
                 inferSumMs = 0.0;
-                lastTime = now;
+
+                lastTime = now;  
             }
 
             cv::putText(frame, cv::format("FPS: %.1F", fps), cv::Point(10, 30), //fps 표시
@@ -181,6 +212,10 @@ int main(){
             cv::putText(frame, cv::format("Infer: %.1f ms", inferMs), cv::Point(10, 65), //infer 표시
                         cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
             cv::putText(frame, cv::format("%dx%d", frame.cols, frame.rows), cv::Point(10, 470), //해상도 표시
+                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+            cv::putText(frame, cv::format("J: %.4f  Jc: %.3f", jitter, jitterCentered), cv::Point(10, 100), //jitter 표시
+                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+            cv::putText(frame, cv::format("d: %.2f ~ %.2f", mn, mx), cv::Point(10, 135),
                         cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
 
             cv::imshow("Webcam", frame);
