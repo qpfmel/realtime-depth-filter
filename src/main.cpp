@@ -6,6 +6,12 @@
 #include <opencv2/dnn.hpp>
 #include <array>
 
+void setAndCheck(cv::VideoCapture& cap, const char* label, int prop, double value) {
+    bool ok = cap.set(prop, value);
+    double back = cap.get(prop);
+    std::cout << label << ": set(" << value << ") -> ok=" << (ok ? "true" : "false") << ", get=" << back << std::endl;
+}
+
 int main(){
     std::cout << "OpenCV version: " << CV_VERSION << std::endl; // OpenCV 버전 출력
 
@@ -82,10 +88,17 @@ int main(){
             return 1;
         }
 
+        setAndCheck(cap, "AUTO_EXPOSURE", cv::CAP_PROP_AUTO_EXPOSURE, 0);
+        setAndCheck(cap, "EXPOSURE", cv::CAP_PROP_EXPOSURE, -6);
+        setAndCheck(cap, "AUTO_WB", cv::CAP_PROP_AUTO_WB, 0);
+        setAndCheck(cap, "AUTOFOCUS", cv::CAP_PROP_AUTOFOCUS, 0);
+
         std::cout << "Reported: " 
                 << cap.get(cv::CAP_PROP_FRAME_WIDTH) << "x"
                 << cap.get(cv::CAP_PROP_FRAME_HEIGHT) << " @ "
                 << cap.get(cv::CAP_PROP_FPS) << " fps" << std::endl;
+
+
 
         cv::Mat frame; //이미지를 채워넣을 공간 생성
         cap.read(frame); //frame에 이미지 채워넣기
@@ -121,12 +134,20 @@ int main(){
         double jitterSum = 0.0;  //1초 동안의 합   
         double jitterCentered = 0.0;
         double jitterCenteredSum = 0.0;
- 
-        while(true){
 
-            cap.read(frame);
-            if(frame.empty()){
-                std::cerr << "Empty frame" << std::endl;
+        double capSumMs = 0.0;
+        double capMs = 0.0;
+        double otherMs = 0.0;
+
+        
+        while(true){
+            auto capStart = std::chrono::steady_clock::now();
+            cap.read(frame); //frame에 이미지 채워넣기
+            auto capEnd = std::chrono::steady_clock::now();
+            capSumMs += std::chrono::duration<double, std::milli>(capEnd - capStart).count();
+
+            if(frame.empty()){ //첫 frame이 비어져있을 경우 카메라 종료
+                std::cerr << "First frame is empty" << std::endl;
                 break;
             }
 
@@ -195,14 +216,18 @@ int main(){
                 inferMs = inferSumMs / frameCount;  //frameCount가 0이 되기전에 계산
                 jitter = jitterSum / frameCount;    
                 jitterCentered = jitterCenteredSum / frameCount;
+                capMs = capSumMs / frameCount;
 
-                std::cout << cv::format("fps=%.1f  infer=%.1fms  J=%.4f  Jc=%.4f  d=%.2f~%.2f", //fps, infer, j, jc, d 값 표시
-                                    fps, inferMs, jitter, jitterCentered, mn, mx) << std::endl;
+                otherMs = (1000.0 / fps) - capMs - inferMs;
+
+                std::cout << cv::format("fps=%.1f cap=%.1fms  infer=%.1fms  J=%.4f  Jc=%.4f  d=%.2f~%.2f", //fps, infer, j, jc, d 값 표시
+                                    fps, capMs, inferMs, jitter, jitterCentered, mn, mx) << std::endl;
                 
                 jitterCenteredSum = 0.0;
                 jitterSum = 0.0;
                 frameCount = 0;
                 inferSumMs = 0.0;
+                capSumMs = 0.0;
 
                 lastTime = now;  
             }
@@ -215,7 +240,11 @@ int main(){
                         cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
             cv::putText(frame, cv::format("J: %.4f  Jc: %.3f", jitter, jitterCentered), cv::Point(10, 100), //jitter 표시
                         cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-            cv::putText(frame, cv::format("d: %.2f ~ %.2f", mn, mx), cv::Point(10, 135),
+            cv::putText(frame, cv::format("d: %.2f ~ %.2f", mn, mx), cv::Point(10, 135),    //깊이맵 최소~최대 표시
+                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+            cv::putText(frame, cv::format("cap: %.1fms", capMs), cv::Point(10, 170),  // cap표시
+                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+            cv::putText(frame, cv::format("otherMs: %.2fms", otherMs), cv::Point(10, 205),  // 전체 소요시간 표시
                         cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
 
             cv::imshow("Webcam", frame);
