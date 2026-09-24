@@ -5,6 +5,9 @@
 #include <onnxruntime_cxx_api.h>
 #include <opencv2/dnn.hpp>
 #include <array>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 void setAndCheck(cv::VideoCapture& cap, const char* label, int prop, double value) {
     bool ok = cap.set(prop, value);
@@ -22,6 +25,11 @@ int main(){
     std::cout << std::endl;
 
     try {
+        // ============================================================
+        // 1. 모델 준비
+        // ============================================================
+        
+        //------모델 입출력 정보 확인----------
         Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "depth_filter");    // 전체 초기화
         Ort::SessionOptions options;    // 설정상자
         OrtCUDAProviderOptions cuda_options; // CUDA설정, 기본생성자가 기본값을 채워줌
@@ -31,6 +39,11 @@ int main(){
         std::cout << "CUDA session created" << std::endl;
 
         Ort::AllocatorWithDefaultOptions allocator; //ONNX Runtime의 메모리 대여창구 (이름 문자열을 담는 메모리)
+
+        // ============================================================
+        // 2. 카메라 준비
+        // ============================================================
+
         // 입력
         for (size_t i = 0; i < session.GetInputCount(); ++i){ //데이터를 넣을 구멍 개수 만큼 반복
             Ort::AllocatedStringPtr name = session.GetInputNameAllocated(i, allocator); // i번째 입력 구멍의 이름 확인
@@ -74,9 +87,8 @@ int main(){
             std::cout << " ]" << std::endl;
         }
     
-
         std::vector<int> params = {
-            cv::CAP_PROP_FOURCC,    cv::VideoWriter::fourcc('Y', 'U', 'Y', '2'),
+            cv::CAP_PROP_FOURCC,    cv::VideoWriter::fourcc('Y', 'U', 'Y', '2'), // 포맷
             cv::CAP_PROP_FRAME_WIDTH, 640,
             cv::CAP_PROP_FRAME_HEIGHT, 480,
             cv::CAP_PROP_FPS, 30
@@ -88,6 +100,7 @@ int main(){
             return 1;
         }
 
+        //---------자동노출, wb, 초점 잠금--------------
         setAndCheck(cap, "AUTO_EXPOSURE", cv::CAP_PROP_AUTO_EXPOSURE, 0);
         setAndCheck(cap, "EXPOSURE", cv::CAP_PROP_EXPOSURE, -6);
         setAndCheck(cap, "AUTO_WB", cv::CAP_PROP_AUTO_WB, 0);
@@ -98,8 +111,6 @@ int main(){
                 << cap.get(cv::CAP_PROP_FRAME_HEIGHT) << " @ "
                 << cap.get(cv::CAP_PROP_FPS) << " fps" << std::endl;
 
-
-
         cv::Mat frame; //이미지를 채워넣을 공간 생성
         cap.read(frame); //frame에 이미지 채워넣기
         if(frame.empty()){ //첫 frame이 비어져있을 경우 카메라 종료
@@ -108,7 +119,26 @@ int main(){
         }
         std::cout << "Actual frame: " << frame.cols << "x" << frame.rows << std::endl;
 
+        // ============================================================
+        // 3. 스레드 준비 — 캡처를 분리한다
+        // ============================================================
 
+        cv::Mat sharedFrame;    //최신 프레임 한장
+        std::mutex frameMutex;  // 자물쇠
+        std::atomic<bool> running{true};    // 종료 신호
+        std::atomic<int> captureCount{0};
+
+        std::thread captureThread([&]() { // 람다함수, [&] - 바깥의 변수들을 원본 그대로 쓰겠다는 뜻
+            cv::Mat local;  //스레드 버퍼
+            while (running) {
+                if (!cap.read(local) || local.empty()) break; // 첫프레임 방지
+
+                std::lock_guard<std::mutex> lock(frameMutex);   //RAII - 만들어질때 잠금, 블록을 벗어나면 자동 해제 (데드락 방지)
+                sharedFrame = local.clone(); // 깊은 복사로 칸이 local을 가르키게 되는것을 방지함 (main이 프레임을 읽는도중 내용이 바뀔 수 있음)
+                captureCount++;
+            }
+        });
+        
 
 
         //=================반복문 밖의 변할필요 없는 고정된 값들==========================
@@ -141,10 +171,20 @@ int main(){
         double capMs = 0.0;
         double otherMs = 0.0;
 
-        
+        // ============================================================
+        // 5. 메인 루프 — 전처리 · 추론 · 표시
+        // ============================================================
         while(true){
             auto capStart = std::chrono::steady_clock::now();
-            cap.read(frame); //frame에 이미지 채워넣기
+
+            cv::Mat frame; //캡쳐한 최신 프레임을 메인프레임이 가져오는 역할 (복사만 빠르게)
+            {   // 중괄호가 잠금을 잠깐동안만 유지하는 역할
+                std::lock_guard<std::mutex> lock(frameMutex);
+                if (sharedFrame.empty()) continue;
+                frame = sharedFrame.clone();
+                
+            }
+
             auto capEnd = std::chrono::steady_clock::now();
             capSumMs += std::chrono::duration<double, std::milli>(capEnd - capStart).count();
 
@@ -178,8 +218,10 @@ int main(){
 
             cv::Mat depth(static_cast<int>(out_shape[1]), static_cast<int>(out_shape[2]), CV_32F, depth_data);
             //위에서 받은 숫자들을 Mat로 감싸고 static_cast로 타입변환(Out_shape는 int64_t(8바이트)이고 Mat는 int(4바이트)로 받음)
-
-            // =====흔들림 측정=========
+            
+            // =======================
+            //      흔들림 측정
+            // =======================
             if (!prevDepth.empty()) {
                 double meanNow = cv::mean(depth)[0];        //이번 프레임 평균
                 double meanPrev = cv::mean(prevDepth)[0];   //직전 프레임 평균
@@ -218,6 +260,7 @@ int main(){
             auto now = std::chrono::steady_clock::now(); 
             double elapsed = std::chrono::duration<double>(now - lastTime).count();
             // 시간 간격을 초단위 소수로 바꿔 단위를 빼고 숫자만 꺼내옴
+
             if(elapsed >= 1.0){  //세는건 매바퀴고 경과 시간이 1초를 넘었을때 계산하고 초기화
                 fps = frameCount / elapsed; // 정수/소수 = 소수
                 
@@ -227,10 +270,12 @@ int main(){
                 capMs = capSumMs / frameCount;
                 jitterGlobal = jitterGlobalSum / frameCount;
 
+                double capFps = captureCount.exchange(0) / elapsed;
+
                 otherMs = (1000.0 / fps) - capMs - inferMs;
 
-                std::cout << cv::format("fps=%.1f cap=%.1fms  infer=%.1fms  J=%.4f  Jc=%.4f  Jg=%.4f  d=%.2f~%.2f", //fps, infer, j, jc, jg, d 값 표시
-                                    fps, capMs, inferMs, jitter, jitterCentered, jitterGlobal, mn, mx) << std::endl;
+                std::cout << cv::format("capFps=%.0f fps=%.1f cap=%.1fms  infer=%.1fms  J=%.4f  Jc=%.4f  Jg=%.4f  d=%.2f~%.2f", //fps, infer, j, jc, jg, d 값 표시
+                                        capFps, fps, capMs, inferMs, jitter, jitterCentered, jitterGlobal, mn, mx) << std::endl;
                 
                 jitterGlobalSum = 0.0;
                 jitterCenteredSum = 0.0;
@@ -241,7 +286,9 @@ int main(){
 
                 lastTime = now;  
             }
-
+            //  ==========================================
+            //                  화면 표시
+            //  ==========================================
             cv::putText(frame, cv::format("FPS: %.1F", fps), cv::Point(10, 30), //fps 표시
                         cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
             cv::putText(frame, cv::format("Infer: %.1f ms", inferMs), cv::Point(10, 65), //infer 표시
@@ -264,6 +311,8 @@ int main(){
                 break;
             }
         }
+        running = false;
+        captureThread.join();
     }
     catch (const Ort::Exception& e) { //try catch로 실패시 원인을 파악하기 위해 사용
         std::cerr << "ORT error: " << e.what() << std::endl;
