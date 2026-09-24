@@ -134,6 +134,8 @@ int main(){
         double jitterSum = 0.0;  //1초 동안의 합   
         double jitterCentered = 0.0;
         double jitterCenteredSum = 0.0;
+        double jitterGlobal = 0.0;
+        double jitterGlobalSum = 0.0;
 
         double capSumMs = 0.0;
         double capMs = 0.0;
@@ -179,16 +181,22 @@ int main(){
 
             // =====흔들림 측정=========
             if (!prevDepth.empty()) {
+                double meanNow = cv::mean(depth)[0];        //이번 프레임 평균
+                double meanPrev = cv::mean(prevDepth)[0];   //직전 프레임 평균
+
+                // Jg - 통째로 밀린양. 두 평균의 차이를 직접 잰다
+                jitterGlobalSum += std::abs(meanNow - meanPrev); 
+
+                // J - 전체 흔들림
                 cv::Mat diff;
-                cv::absdiff(depth, prevDepth, diff); //픽셀마다 |(이번) - (직전)|(절댓값)을 구해 diff에 넣음
-                jitterSum += cv::mean(diff)[0];      //전체 픽셀의 평균
+                cv::absdiff(depth, prevDepth, diff);
+                jitterSum += cv::mean(diff)[0];
 
-
-                cv::Mat a = depth - cv::Scalar(cv::mean(depth)[0]);    //프레임마다 자기 평균을 빼기
-                cv::Mat b = prevDepth - cv::Scalar(cv::mean(prevDepth)[0]);
-
-                cv::absdiff(a, b, diff);                     //픽셀마다 |(이번-이번평균) - (직전 - 직전평균)|(절댓값)을 구해 diff에 넣음
-                jitterCenteredSum += cv::mean(diff)[0];      //전체 픽셀의 평균
+                // Jc - 형태변형. 각자 자기 평균을 뺀 뒤 비교 (J를 밝기 보정한 값)
+                cv::Mat a = depth - cv::Scalar(meanNow);
+                cv::Mat b = prevDepth - cv::Scalar(meanPrev);
+                cv::absdiff(a, b, diff);
+                jitterCenteredSum += cv::mean(diff)[0];
             }
             prevDepth = depth.clone(); //depth는 ONNX Runtime의 출력 메모리를 가르켜줄뿐이라 clone()을 해서 완전히 값을 복사해야한다
             
@@ -217,12 +225,14 @@ int main(){
                 jitter = jitterSum / frameCount;    
                 jitterCentered = jitterCenteredSum / frameCount;
                 capMs = capSumMs / frameCount;
+                jitterGlobal = jitterGlobalSum / frameCount;
 
                 otherMs = (1000.0 / fps) - capMs - inferMs;
 
-                std::cout << cv::format("fps=%.1f cap=%.1fms  infer=%.1fms  J=%.4f  Jc=%.4f  d=%.2f~%.2f", //fps, infer, j, jc, d 값 표시
-                                    fps, capMs, inferMs, jitter, jitterCentered, mn, mx) << std::endl;
+                std::cout << cv::format("fps=%.1f cap=%.1fms  infer=%.1fms  J=%.4f  Jc=%.4f  Jg=%.4f  d=%.2f~%.2f", //fps, infer, j, jc, jg, d 값 표시
+                                    fps, capMs, inferMs, jitter, jitterCentered, jitterGlobal, mn, mx) << std::endl;
                 
+                jitterGlobalSum = 0.0;
                 jitterCenteredSum = 0.0;
                 jitterSum = 0.0;
                 frameCount = 0;
