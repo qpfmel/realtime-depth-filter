@@ -20,10 +20,23 @@ void setAndCheck(cv::VideoCapture& cap, const char* label, int prop, double valu
 struct ThreadGuard {
     std::thread& t;
     std::atomic<bool>& running;
+    std::mutex& m;
+    std::condition_variable& cv;
     ~ThreadGuard() {
-        running = false;
+        {
+            std::lock_guard<std::mutex> lock(m);
+            running = false;
+        }
+        cv.notify_all();
         if (t.joinable()) t.join();
     }
+    
+};
+
+struct Result {
+    cv::Mat frame;
+    cv::Mat depth;
+    double inferMs = 0, J = 0, Jc = 0, Jg = 0;
 };
 
 int main(){
@@ -142,8 +155,13 @@ int main(){
         std::atomic<bool> running{true};    // 종료 신호
         std::atomic<int> captureCount{0};
 
+        Result sharedResult;
+        int resultId = 0;
+        std::mutex resultMutex;
+        std::atomic<int> displayCount{0};
+
+
         std::thread captureThread([&]() { // 람다함수, [&] - 바깥의 변수들을 원본 그대로 쓰겠다는 뜻
-            
             cv::Mat local;  //스레드 버퍼
             while (running) {
                 if (!cap.read(local) || local.empty()) break; // 첫프레임 방지
@@ -155,10 +173,14 @@ int main(){
                 frameCv.notify_one(); // 초인종, 기다리는 쪽 하나를 깨움
                 captureCount++;
             }
-            running = false;        // 카메라가 끊겨서 나온경우도 종료를 알림
-            frameCv.notify_all();   // 잠든쪽이 있으면 전부 깨워서 탈출
+
+            {
+                std::lock_guard<std::mutex> lock(frameMutex);
+                running = false;
+            }
+            frameCv.notify_all();
         });
-        ThreadGuard guard{captureThread, running};
+        ThreadGuard captureGuard{captureThread, running, frameMutex, frameCv};
 
         // ================================
         // 4. 반복문 밖의 변할필요 없는 고정된 값들
@@ -173,159 +195,180 @@ int main(){
 
         const char* input_names[] = {"pixel_values"};
         const char* output_names[] = {"predicted_depth"};
+
+
+        std::thread inferThread([&]() {
+            try{
+                // ---------추론 스레드에서만 쓰는 변수------
+                int lastId = 0;
+                cv::Mat prevDepth;
+                int frameCount = 0;
+                auto lastTime = std::chrono::steady_clock::now();
+                double waitSumMs = 0, inferSumMs = 0, jSum = 0, jcSum = 0, jgSum = 0;
+                double inferMs = 0, J = 0, Jc =0, Jg = 0;
+                
+                while(running) {
+                    auto waitStart = std::chrono::steady_clock::now();
+                    cv::Mat frame; //캡쳐한 최신 프레임을 추론스레드가 가져오는 역할 (복사만 빠르게)
+                    {   // 중괄호가 잠금을 잠깐동안만 유지하는 역할
+                        std::unique_lock<std::mutex> lock(frameMutex); //스레드 잠금
+                        frameCv.wait(lock, [&] { return frameId != lastId || !running; }); //조건이 참이면 바로 복사, 거짓이면 잠금을 풀고 잠듬, 캡처가 신호를 보내면 다시 깨서 조건확인
+                        if (!running) break; //종료중이면 루프 탈출
+                        frame = sharedFrame.clone();
+                        lastId = frameId; //받은 번호 기억
+                    }
+                    auto waitEnd =  std::chrono::steady_clock::now();
+                    waitSumMs += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
+
+                    //-----------전처리-----------
+                    cv::Mat rgb;
+                    cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);    // 색 순서를 bgr에서 rgb로(OpenCV는 bgr이지만 해당 모델은 rgb여서)
+                    cv::Mat resized;
+                    cv::resize(rgb, resized, cv::Size(kInputW, kInputH));   // 모델이 14x14 조각으로 보기때문에 14배수로 진행
+                    cv::Mat f32;
+                    resized.convertTo(f32, CV_32F, 1.0 / 255.0); // 0~1(소수)로 숫자형식 변경
+                    cv::Mat norm = (f32 - cv::Scalar(0.485, 0.456, 0.406)) / cv::Scalar(0.229, 0.224, 0.225);
+                    //학습할때 쓴 평균/표준편차로 맞춘다 (ImageNet 기준)
+                    cv::Mat blob = cv::dnn::blobFromImage(norm); // 배치순서 바꾸기(h,w,c -> p(장수), c, h, w)
+
+                    //-----------추론--------------
+                    Ort::Value input = Ort::Value::CreateTensor<float>(
+                        mem, blob.ptr<float>(), blob.total(), input_shape.data(), input_shape.size()); //텐서 생성(얕은 복사)
+                    auto inferStart = std::chrono::steady_clock::now(); // 추론 시작 전 시각
+                    std::vector<Ort::Value> outputs = session.Run(Ort::RunOptions{nullptr}, input_names, &input, 1, output_names, 1);   // 실제 모델을 실행하는 코드
+                    auto inferEnd = std::chrono::steady_clock::now(); //추론 직후 시각
+                    inferSumMs += std::chrono::duration<double, std::milli>(inferEnd - inferStart).count(); // 이번 프레임의 추론시간을 합계에 더한다 (밀리초 변환)
+
+                    std::vector<int64_t> out_shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape(); //출력 모양 읽기
+                    float* depth_data = outputs[0].GetTensorMutableData<float>(); //깊이 숫자들의 시작주소 받기
+
+                    cv::Mat depth(static_cast<int>(out_shape[1]), static_cast<int>(out_shape[2]), CV_32F, depth_data);
+                    //위에서 받은 숫자들을 Mat로 감싸고 static_cast로 타입변환(Out_shape는 int64_t(8바이트)이고 Mat는 int(4바이트)로 받음)
+                    
+
+                    // =======================
+                    //      흔들림 측정
+                    // =======================
+                    if (!prevDepth.empty()) {
+                        double meanNow = cv::mean(depth)[0];        //이번 프레임 평균
+                        double meanPrev = cv::mean(prevDepth)[0];   //직전 프레임 평균
+
+                        // Jg - 통째로 밀린양. 두 평균의 차이를 직접 잰다
+                        jgSum += std::abs(meanNow - meanPrev); 
+
+                        // J - 전체 흔들림
+                        cv::Mat diff;
+                        cv::absdiff(depth, prevDepth, diff);
+                        jSum += cv::mean(diff)[0];
+
+                        // Jc - 형태변형. 각자 자기 평균을 뺀 뒤 비교 (J를 밝기 보정한 값)
+                        cv::Mat a = depth - cv::Scalar(meanNow);
+                        cv::Mat b = prevDepth - cv::Scalar(meanPrev);
+                        cv::absdiff(a, b, diff);
+                        jcSum += cv::mean(diff)[0];
+                    }
+                    prevDepth = depth.clone(); //depth는 ONNX Runtime의 출력 메모리를 가르켜줄뿐이라 clone()을 해서 완전히 값을 복사해야한다
+                    
+                    frameCount++;
+                    auto now = std::chrono::steady_clock::now();
+
+                    //------------1초 통계-----------
+                    double elapsed = std::chrono::duration<double>(now - lastTime).count();
+                    // 시간 간격을 초단위 소수로 바꿔 단위를 빼고 숫자만 꺼내옴
+                    if(elapsed >= 1.0){  //세는건 매바퀴고 경과 시간이 1초를 넘었을때 계산하고 초기화
+
+                        double capFps = captureCount.exchange(0) / elapsed;
+                        double dispFps = displayCount.exchange(0) / elapsed;
+                        double inferFps = frameCount / elapsed;
+                        double waitMs = waitSumMs / frameCount;
+
+                        inferMs = inferSumMs / frameCount;  //frameCount가 0이 되기전에 계산
+                        J = jSum / frameCount;
+                        Jc = jcSum / frameCount;
+                        Jg = jgSum / frameCount;
+
+                        std::cout << cv::format("capFps=%.0f inferFps=%.1f dispFps=%.1f wait=%.1fms  infer=%.1fms  J=%.4f  Jc=%.4f  Jg=%.4f ",
+                                                capFps, inferFps, dispFps, waitMs, inferMs, J, Jc, Jg) << std::endl;
+
+                        frameCount = 0;
+                        waitSumMs = inferSumMs = jSum = jcSum = jgSum = 0;
+                        lastTime = now;  
+                    }
+                    
+                    // Result 구조체에 넣기
+                    {
+                        std::lock_guard<std::mutex> lock(resultMutex);
+                        sharedResult.frame = frame.clone();
+                        sharedResult.depth = depth.clone();
+                        sharedResult.inferMs = inferMs;
+                        sharedResult.J = J;
+                        sharedResult.Jc = Jc;
+                        sharedResult.Jg = Jg;
+                        resultId++;
+                    }
+                }
+            }
+            catch (const std::exception& e) {
+                std::cerr << "Infer thread error: " << e.what() << std::endl;
+                {
+                    std::lock_guard<std::mutex> lock(frameMutex);
+                    running = false;
+                }
+                frameCv.notify_all();
+            }
+        });
+        ThreadGuard inferGuard{inferThread, running, frameMutex, frameCv};
+
         
-        int frameCount = 0;                                 //fps 측정용 변수
-        auto lastTime = std::chrono::steady_clock::now();   //현재 시각 가져오기
-        double fps = 0.0;                                   //fps
-        double inferSumMs = 0.0;    //1초동안 추론에 쓴 시간의 합
-        double inferMs = 0.0;       //화면에 보여줄 평균 추론 시간
-
-        cv::Mat prevDepth;       //직전 프레임의 깊이맵
-        double jitter = 0.0;     //화면에 보여줄 흔들림 값
-        double jitterSum = 0.0;  //1초 동안의 합   
-        double jitterCentered = 0.0;
-        double jitterCenteredSum = 0.0;
-        double jitterGlobal = 0.0;
-        double jitterGlobalSum = 0.0;
-
-        double capSumMs = 0.0;
-        double capMs = 0.0;
-        double otherMs = 0.0;
-
-        int lastId = 0; // 메인이 마지막에 받은 번호
-
         // ============================================================
-        // 5. 메인 루프 — 전처리 · 추론 · 표시
+        // 표시만
         // ============================================================
-        while(true){
-            auto capStart = std::chrono::steady_clock::now();
+            int lastResultId = 0;
+            Result shown;
 
-            cv::Mat frame; //캡쳐한 최신 프레임을 메인프레임이 가져오는 역할 (복사만 빠르게)
-            {   // 중괄호가 잠금을 잠깐동안만 유지하는 역할
-                std::unique_lock<std::mutex> lock(frameMutex); //스레드 잠금 (main스레드만 활동)
-                frameCv.wait(lock, [&] { return frameId != lastId || !running; }); //조건이 참이면 바로 복사, 거짓이면 잠금을 풀고 잠듬, 캡처가 신호를 보내면 다시 깨서 조건확인
-                if (!running) break; //종료중이면 루프 탈출
-                frame = sharedFrame.clone();
-                lastId = frameId; //받은 번호 기억
+            while(running) {
+                bool fresh = false;
+                {
+                    std::lock_guard<std::mutex> lock(resultMutex);
+                    if (resultId != lastResultId) {
+                        shown = sharedResult;
+                        shown.frame = sharedResult.frame.clone();
+                        shown.depth = sharedResult.depth.clone();
+                        lastResultId = resultId;
+                        fresh = true;
+                    }
+                }
+
+                if (fresh) {
+                    //시각화
+                    cv::Mat depth_vis;
+                    cv::normalize(shown.depth, depth_vis, 0, 255, cv::NORM_MINMAX, CV_8U); //최대, 최솟값을 0~255로 펼쳐버린다
+                    cv::Mat depth_color;
+                    cv::applyColorMap(depth_vis, depth_color, cv::COLORMAP_INFERNO);
+
+                    double mn = 0, mx = 0;
+                    cv::minMaxLoc(shown.depth, &mn, &mx);
+
+                    //  ==========================================
+                    //                  화면 표시
+                    //  ==========================================
+                    cv::putText(shown.frame, cv::format("Infer: %.1f ms", shown.inferMs), cv::Point(10, 30),
+                                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+                    cv::putText(shown.frame, cv::format("J: %.4f  Jc: %.4f Jg: %.4f", shown.J, shown.Jc, shown.Jg), cv::Point(10, 65),
+                                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+                    cv::putText(shown.frame, cv::format("d: %.2f ~ %.2f", mn, mx), cv::Point(10, 100),
+                                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+
+                    cv::imshow("Webcam", shown.frame);
+                    cv::imshow("Depth", depth_color);
+                    displayCount++;
+                }
+
+                if (cv::waitKey(1) == 27) {
+                    break;
+                }
+
             }
-
-            auto capEnd = std::chrono::steady_clock::now();
-            capSumMs += std::chrono::duration<double, std::milli>(capEnd - capStart).count();
-
-            cv::Mat rgb;
-            cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);    // 색 순서를 bgr에서 rgb로(OpenCV는 bgr이지만 해당 모델은 rgb여서)
-            cv::Mat resized;
-            cv::resize(rgb, resized, cv::Size(kInputW, kInputH));   // 모델이 14x14 조각으로 보기때문에 14배수로 진행
-            cv::Mat f32;
-            resized.convertTo(f32, CV_32F, 1.0 / 255.0); // 0~1(소수)로 숫자형식 변경
-            cv::Mat norm = (f32 - cv::Scalar(0.485, 0.456, 0.406)) / cv::Scalar(0.229, 0.224, 0.225);
-            //학습할때 쓴 평균/표준편차로 맞춘다 (ImageNet 기준)
-            cv::Mat blob = cv::dnn::blobFromImage(norm); // 배치순서 바꾸기(h,w,c -> p(장수), c, h, w)
-
-            
-            Ort::Value input = Ort::Value::CreateTensor<float>(
-                mem, blob.ptr<float>(), blob.total(), input_shape.data(), input_shape.size()); //텐서 생성(얕은 복사)
-            
-            auto inferStart = std::chrono::steady_clock::now(); // 추론 시작 전 시각
-            std::vector<Ort::Value> outputs = session.Run(Ort::RunOptions{nullptr}, input_names, &input, 1, output_names, 1);   // 실제 모델을 실행하는 코드
-            auto inferEnd = std::chrono::steady_clock::now(); //추론 직후 시각
-            
-            inferSumMs += std::chrono::duration<double, std::milli>(inferEnd - inferStart).count(); // 이번 프레임의 추론시간을 합계에 더한다 (밀리초 변환)
-
-            std::vector<int64_t> out_shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape(); //출력 모양 읽기
-            float* depth_data = outputs[0].GetTensorMutableData<float>(); //깊이 숫자들의 시작주소 받기
-
-            cv::Mat depth(static_cast<int>(out_shape[1]), static_cast<int>(out_shape[2]), CV_32F, depth_data);
-            //위에서 받은 숫자들을 Mat로 감싸고 static_cast로 타입변환(Out_shape는 int64_t(8바이트)이고 Mat는 int(4바이트)로 받음)
-            
-            // =======================
-            //      흔들림 측정
-            // =======================
-            if (!prevDepth.empty()) {
-                double meanNow = cv::mean(depth)[0];        //이번 프레임 평균
-                double meanPrev = cv::mean(prevDepth)[0];   //직전 프레임 평균
-
-                // Jg - 통째로 밀린양. 두 평균의 차이를 직접 잰다
-                jitterGlobalSum += std::abs(meanNow - meanPrev); 
-
-                // J - 전체 흔들림
-                cv::Mat diff;
-                cv::absdiff(depth, prevDepth, diff);
-                jitterSum += cv::mean(diff)[0];
-
-                // Jc - 형태변형. 각자 자기 평균을 뺀 뒤 비교 (J를 밝기 보정한 값)
-                cv::Mat a = depth - cv::Scalar(meanNow);
-                cv::Mat b = prevDepth - cv::Scalar(meanPrev);
-                cv::absdiff(a, b, diff);
-                jitterCenteredSum += cv::mean(diff)[0];
-            }
-            prevDepth = depth.clone(); //depth는 ONNX Runtime의 출력 메모리를 가르켜줄뿐이라 clone()을 해서 완전히 값을 복사해야한다
-            
-
-            //시각화
-            cv::Mat depth_vis;
-            cv::normalize(depth, depth_vis, 0, 255, cv::NORM_MINMAX, CV_8U); //최대, 최솟값을 0~255로 펼쳐버린다
-            cv::Mat depth_color;
-            cv::applyColorMap(depth_vis, depth_color, cv::COLORMAP_INFERNO);
-
-            double mn = 0, mx = 0;
-            cv::minMaxLoc(depth, &mn, &mx); // 변수의 주소를 넘겨서 주소에 직접적으로 값을 새겨넣게함
-
-            frameCount++; // empty()다음에 있어 제대로 읽힌 프레임만 셈
-            auto now = std::chrono::steady_clock::now(); 
-            double elapsed = std::chrono::duration<double>(now - lastTime).count();
-            // 시간 간격을 초단위 소수로 바꿔 단위를 빼고 숫자만 꺼내옴
-
-            if(elapsed >= 1.0){  //세는건 매바퀴고 경과 시간이 1초를 넘었을때 계산하고 초기화
-                fps = frameCount / elapsed; // 정수/소수 = 소수
-                
-                inferMs = inferSumMs / frameCount;  //frameCount가 0이 되기전에 계산
-                jitter = jitterSum / frameCount;    
-                jitterCentered = jitterCenteredSum / frameCount;
-                capMs = capSumMs / frameCount;
-                jitterGlobal = jitterGlobalSum / frameCount;
-
-                double capFps = captureCount.exchange(0) / elapsed;
-
-                otherMs = (1000.0 / fps) - capMs - inferMs;
-
-                std::cout << cv::format("capFps=%.0f fps=%.1f cap=%.1fms  infer=%.1fms  J=%.4f  Jc=%.4f  Jg=%.4f  d=%.2f~%.2f", //fps, infer, j, jc, jg, d 값 표시
-                                        capFps, fps, capMs, inferMs, jitter, jitterCentered, jitterGlobal, mn, mx) << std::endl;
-                
-                jitterGlobalSum = 0.0;
-                jitterCenteredSum = 0.0;
-                jitterSum = 0.0;
-                frameCount = 0;
-                inferSumMs = 0.0;
-                capSumMs = 0.0;
-
-                lastTime = now;  
-            }
-            //  ==========================================
-            //                  화면 표시
-            //  ==========================================
-            cv::putText(frame, cv::format("FPS: %.1F", fps), cv::Point(10, 30), //fps 표시
-                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-            cv::putText(frame, cv::format("Infer: %.1f ms", inferMs), cv::Point(10, 65), //infer 표시
-                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-            cv::putText(frame, cv::format("%dx%d", frame.cols, frame.rows), cv::Point(10, 470), //해상도 표시
-                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-            cv::putText(frame, cv::format("J: %.4f  Jc: %.3f", jitter, jitterCentered), cv::Point(10, 100), //jitter 표시
-                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-            cv::putText(frame, cv::format("d: %.2f ~ %.2f", mn, mx), cv::Point(10, 135),    //깊이맵 최소~최대 표시
-                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-            cv::putText(frame, cv::format("cap: %.1fms", capMs), cv::Point(10, 170),  // cap표시
-                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-            cv::putText(frame, cv::format("otherMs: %.2fms", otherMs), cv::Point(10, 205),  // 전체 소요시간 표시
-                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-
-            cv::imshow("Webcam", frame);
-            cv::imshow("Depth", depth_color);
-            
-            if(cv::waitKey(1) == 27){ // esc 누를 경우 반복탈출
-                break;
-            }
-        }
     }
     catch (const Ort::Exception& e) { //try catch로 실패시 원인을 파악하기 위해 사용
         std::cerr << "ORT error: " << e.what() << std::endl;
