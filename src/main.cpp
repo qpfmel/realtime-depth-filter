@@ -9,6 +9,7 @@
 #include <mutex>
 #include <atomic>
 #include <stdexcept>
+#include <condition_variable>
 
 void setAndCheck(cv::VideoCapture& cap, const char* label, int prop, double value) {
     bool ok = cap.set(prop, value);
@@ -135,19 +136,27 @@ int main(){
         // ============================================================
 
         cv::Mat sharedFrame;    //최신 프레임 한장
+        int frameId = 0;        //방 번호표, 캡처가 넣을때마다 +1
         std::mutex frameMutex;  // 자물쇠
+        std::condition_variable frameCv; // 새프레임이 왔다는 신호
         std::atomic<bool> running{true};    // 종료 신호
         std::atomic<int> captureCount{0};
 
         std::thread captureThread([&]() { // 람다함수, [&] - 바깥의 변수들을 원본 그대로 쓰겠다는 뜻
+            
             cv::Mat local;  //스레드 버퍼
             while (running) {
                 if (!cap.read(local) || local.empty()) break; // 첫프레임 방지
-
-                std::lock_guard<std::mutex> lock(frameMutex);   //RAII - 만들어질때 잠금, 블록을 벗어나면 자동 해제 (데드락 방지)
-                sharedFrame = local.clone(); // 깊은 복사로 칸이 local을 가르키게 되는것을 방지함 (main이 프레임을 읽는도중 내용이 바뀔 수 있음)
+                {
+                    std::lock_guard<std::mutex> lock(frameMutex);   //RAII - 만들어질때 잠금, 블록을 벗어나면 자동 해제 (데드락 방지)
+                    sharedFrame = local.clone(); // 깊은 복사로 칸이 local을 가르키게 되는것을 방지함 (main이 프레임을 읽는도중 내용이 바뀔 수 있음)
+                    frameId++;
+                }
+                frameCv.notify_one(); // 초인종, 기다리는 쪽 하나를 깨움
                 captureCount++;
             }
+            running = false;        // 카메라가 끊겨서 나온경우도 종료를 알림
+            frameCv.notify_all();   // 잠든쪽이 있으면 전부 깨워서 탈출
         });
         ThreadGuard guard{captureThread, running};
 
@@ -183,6 +192,8 @@ int main(){
         double capMs = 0.0;
         double otherMs = 0.0;
 
+        int lastId = 0; // 메인이 마지막에 받은 번호
+
         // ============================================================
         // 5. 메인 루프 — 전처리 · 추론 · 표시
         // ============================================================
@@ -191,10 +202,11 @@ int main(){
 
             cv::Mat frame; //캡쳐한 최신 프레임을 메인프레임이 가져오는 역할 (복사만 빠르게)
             {   // 중괄호가 잠금을 잠깐동안만 유지하는 역할
-                std::lock_guard<std::mutex> lock(frameMutex);
-                if (sharedFrame.empty()) continue;
+                std::unique_lock<std::mutex> lock(frameMutex); //스레드 잠금 (main스레드만 활동)
+                frameCv.wait(lock, [&] { return frameId != lastId || !running; }); //조건이 참이면 바로 복사, 거짓이면 잠금을 풀고 잠듬, 캡처가 신호를 보내면 다시 깨서 조건확인
+                if (!running) break; //종료중이면 루프 탈출
                 frame = sharedFrame.clone();
-                
+                lastId = frameId; //받은 번호 기억
             }
 
             auto capEnd = std::chrono::steady_clock::now();
