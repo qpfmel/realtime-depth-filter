@@ -8,12 +8,22 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <stdexcept>
 
 void setAndCheck(cv::VideoCapture& cap, const char* label, int prop, double value) {
     bool ok = cap.set(prop, value);
     double back = cap.get(prop);
     std::cout << label << ": set(" << value << ") -> ok=" << (ok ? "true" : "false") << ", get=" << back << std::endl;
 }
+
+struct ThreadGuard {
+    std::thread& t;
+    std::atomic<bool>& running;
+    ~ThreadGuard() {
+        running = false;
+        if (t.joinable()) t.join();
+    }
+};
 
 int main(){
     std::cout << "OpenCV version: " << CV_VERSION << std::endl; // OpenCV 버전 출력
@@ -139,8 +149,7 @@ int main(){
                 captureCount++;
             }
         });
-        
-
+        ThreadGuard guard{captureThread, running};
 
         // ================================
         // 4. 반복문 밖의 변할필요 없는 고정된 값들
@@ -305,11 +314,13 @@ int main(){
                 break;
             }
         }
-        running = false;
-        captureThread.join();
     }
     catch (const Ort::Exception& e) { //try catch로 실패시 원인을 파악하기 위해 사용
         std::cerr << "ORT error: " << e.what() << std::endl;
+        return 1;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
     return 0;
