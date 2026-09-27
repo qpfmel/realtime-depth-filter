@@ -40,10 +40,7 @@ int main(){
 
         Ort::AllocatorWithDefaultOptions allocator; //ONNX Runtime의 메모리 대여창구 (이름 문자열을 담는 메모리)
 
-        // ============================================================
-        // 2. 카메라 준비
-        // ============================================================
-
+        //------------------------모델 입출력 정보 확인--------------------------------
         // 입력
         for (size_t i = 0; i < session.GetInputCount(); ++i){ //데이터를 넣을 구멍 개수 만큼 반복
             Ort::AllocatedStringPtr name = session.GetInputNameAllocated(i, allocator); // i번째 입력 구멍의 이름 확인
@@ -52,7 +49,7 @@ int main(){
             auto tensor_info = type_info.GetTensorTypeAndShapeInfo(); // 종류 정보중 텐서 정보만 좁혀서 본다 (type_info보다 오래쓸경우 댕글링 발생)
                                                                       //tensor_info는 가르키기만 하는데 type_info가 먼저 사라지면 반납된 메모리의 번호를 들고있음 그게 댕글링포인터
 
-            std::cout << "Output " << name.get();   // unique_ptr에 든 실제 글자 주소를 잠깐 꺼낸다 (소유는 여전히 name이 한다)
+            std::cout << "Input " << name.get();   // unique_ptr에 든 실제 글자 주소를 잠깐 꺼낸다 (소유는 여전히 name이 한다)
             if (tensor_info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) { //데이터 타입이 float32일 경우
                 std::cout << "  type=" << "float32";
             } 
@@ -86,6 +83,10 @@ int main(){
             }
             std::cout << " ]" << std::endl;
         }
+
+        // ============================================================
+        // 2. 카메라 준비
+        // ============================================================
     
         std::vector<int> params = {
             cv::CAP_PROP_FOURCC,    cv::VideoWriter::fourcc('Y', 'U', 'Y', '2'), // 포맷
@@ -141,7 +142,9 @@ int main(){
         
 
 
-        //=================반복문 밖의 변할필요 없는 고정된 값들==========================
+        // ================================
+        // 4. 반복문 밖의 변할필요 없는 고정된 값들
+        // ================================
 
         const int kInputW = 518; //14의 배수중 웹캠 비율에 가장 유사한 숫자
         const int kInputH = 392;
@@ -187,11 +190,6 @@ int main(){
 
             auto capEnd = std::chrono::steady_clock::now();
             capSumMs += std::chrono::duration<double, std::milli>(capEnd - capStart).count();
-
-            if(frame.empty()){ //첫 frame이 비어져있을 경우 카메라 종료
-                std::cerr << "First frame is empty" << std::endl;
-                break;
-            }
 
             cv::Mat rgb;
             cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);    // 색 순서를 bgr에서 rgb로(OpenCV는 bgr이지만 해당 모델은 rgb여서)
@@ -251,10 +249,6 @@ int main(){
 
             double mn = 0, mx = 0;
             cv::minMaxLoc(depth, &mn, &mx); // 변수의 주소를 넘겨서 주소에 직접적으로 값을 새겨넣게함
-
-            std::cout << "depth shape=[" << out_shape[0] << " " << out_shape[1] << " " << out_shape[2] //min, max 값 표시
-                    << " ] min=" << mn << " max=" << mx <<std::endl;
-
 
             frameCount++; // empty()다음에 있어 제대로 읽힌 프레임만 셈
             auto now = std::chrono::steady_clock::now(); 
