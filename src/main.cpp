@@ -35,8 +35,11 @@ struct ThreadGuard {
 
 struct Result {
     cv::Mat frame;
-    cv::Mat depth;
+    cv::Mat depth;      // 원본 깊이맵
+    cv::Mat depthStab;  // 안정화 깊이맵
     double inferMs = 0, J = 0, Jc = 0, Jg = 0;
+    double Js = 0;  //안정화결과의 J
+    float a = 1.0f;
 };
 
 int main(){
@@ -160,6 +163,7 @@ int main(){
         std::mutex resultMutex;
         std::atomic<int> displayCount{0};
 
+        std::atomic<float> alpha{1.0f};
 
         std::thread captureThread([&]() { // 람다함수, [&] - 바깥의 변수들을 원본 그대로 쓰겠다는 뜻
             cv::Mat local;  //스레드 버퍼
@@ -206,6 +210,8 @@ int main(){
                 auto lastTime = std::chrono::steady_clock::now();
                 double waitSumMs = 0, inferSumMs = 0, jSum = 0, jcSum = 0, jgSum = 0;
                 double inferMs = 0, J = 0, Jc =0, Jg = 0;
+                cv::Mat ema; //EMA의 이전 출력
+                double jsSum = 0, Js = 0;
                 
                 while(running) {
                     auto waitStart = std::chrono::steady_clock::now();
@@ -268,6 +274,21 @@ int main(){
                         jcSum += cv::mean(diff)[0];
                     }
                     prevDepth = depth.clone(); //depth는 ONNX Runtime의 출력 메모리를 가르켜줄뿐이라 clone()을 해서 완전히 값을 복사해야한다
+
+                    //----------안정화 (EMA)----------
+                    float a = alpha.load();     //이번 프레임에 쓸 alpa
+                    if(ema.empty()) {           
+                        ema = depth.clone();    //첫프레임은 그대로
+                    } 
+                    else {
+                        cv::Mat next;
+                        cv::addWeighted(depth, a, ema, 1.0 - a, 0.0, next); //ema 공식
+                        cv::Mat d;
+                        cv::absdiff(next, ema, d); // J 안정화 구하기 ()
+                        jsSum += cv::mean(d)[0];
+                        ema = next; // 다음번에 쓸 이번출력 저장
+                    }
+
                     
                     frameCount++;
                     auto now = std::chrono::steady_clock::now();
@@ -286,24 +307,28 @@ int main(){
                         J = jSum / frameCount;
                         Jc = jcSum / frameCount;
                         Jg = jgSum / frameCount;
+                        Js = jsSum / frameCount;
 
-                        std::cout << cv::format("capFps=%.0f inferFps=%.1f dispFps=%.1f wait=%.1fms  infer=%.1fms  J=%.4f  Jc=%.4f  Jg=%.4f ",
-                                                capFps, inferFps, dispFps, waitMs, inferMs, J, Jc, Jg) << std::endl;
+                        std::cout << cv::format("capFps=%.0f inferFps=%.1f dispFps=%.1f wait=%.1fms  infer=%.1fms  J=%.4f  Jc=%.4f  Jg=%.4f  a=%.1f  Js=%.4f",
+                                                capFps, inferFps, dispFps, waitMs, inferMs, J, Jc, Jg, a, Js) << std::endl;
 
                         frameCount = 0;
-                        waitSumMs = inferSumMs = jSum = jcSum = jgSum = 0;
+                        waitSumMs = inferSumMs = jSum = jcSum = jgSum = jsSum = 0;
                         lastTime = now;  
                     }
                     
                     // Result 구조체에 넣기
-                    {
+                    {   // 추론스레드가 넣고 main스레드가 꺼냄
                         std::lock_guard<std::mutex> lock(resultMutex);
                         sharedResult.frame = frame.clone();
                         sharedResult.depth = depth.clone();
+                        sharedResult.depthStab = ema.clone();
                         sharedResult.inferMs = inferMs;
                         sharedResult.J = J;
                         sharedResult.Jc = Jc;
                         sharedResult.Jg = Jg;
+                        sharedResult.Js = Js;
+                        sharedResult.a = a;
                         resultId++;
                     }
                 }
@@ -319,12 +344,13 @@ int main(){
         });
         ThreadGuard inferGuard{inferThread, running, frameMutex, frameCv};
 
-        
+        bool showStab = false;
+
         // ============================================================
         // 표시만
         // ============================================================
             int lastResultId = 0;
-            Result shown;
+            Result shown; // main스레드 전용
 
             while(running) {
                 bool fresh = false;
@@ -334,6 +360,7 @@ int main(){
                         shown = sharedResult;
                         shown.frame = sharedResult.frame.clone();
                         shown.depth = sharedResult.depth.clone();
+                        shown.depthStab = sharedResult.depthStab.clone();
                         lastResultId = resultId;
                         fresh = true;
                     }
@@ -341,13 +368,14 @@ int main(){
 
                 if (fresh) {
                     //시각화
-                    cv::Mat depth_vis;
-                    cv::normalize(shown.depth, depth_vis, 0, 255, cv::NORM_MINMAX, CV_8U); //최대, 최솟값을 0~255로 펼쳐버린다
-                    cv::Mat depth_color;
-                    cv::applyColorMap(depth_vis, depth_color, cv::COLORMAP_INFERNO);
-
                     double mn = 0, mx = 0;
                     cv::minMaxLoc(shown.depth, &mn, &mx);
+
+                    cv::Mat depth_vis;
+                    const cv::Mat& toShow = showStab ? shown.depthStab : shown.depth;
+                    cv::normalize(toShow, depth_vis, 0, 255, cv::NORM_MINMAX, CV_8U);
+                    cv::Mat depth_color;
+                    cv::applyColorMap(depth_vis, depth_color, cv::COLORMAP_INFERNO);
 
                     //  ==========================================
                     //                  화면 표시
@@ -358,16 +386,19 @@ int main(){
                                 cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
                     cv::putText(shown.frame, cv::format("d: %.2f ~ %.2f", mn, mx), cv::Point(10, 100),
                                 cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+                    cv::putText(shown.frame, cv::format("%s  a=%.1f  J=%.4f  Js=%.4f", showStab ? "STAB" : "RAW", shown.a, shown.J, shown.Js),
+                                cv::Point(10, 135), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
 
                     cv::imshow("Webcam", shown.frame);
                     cv::imshow("Depth", depth_color);
                     displayCount++;
                 }
 
-                if (cv::waitKey(1) == 27) {
-                    break;
-                }
-
+                int key = cv::waitKey(1);
+                if (key == 27) break;
+                if (key >= '1' && key <= '9') alpha = (key - '0') / 10.0f;
+                if (key == '0') alpha = 1.0f;
+                if (key == 's') showStab = !showStab;
             }
     }
     catch (const Ort::Exception& e) { //try catch로 실패시 원인을 파악하기 위해 사용
