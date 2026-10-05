@@ -212,6 +212,7 @@ int main(){
                 double inferMs = 0, J = 0, Jc =0, Jg = 0;
                 cv::Mat ema; //EMA의 이전 출력
                 double jsSum = 0, Js = 0;
+                double emaSum = 0, emaT = 0;
                 
                 while(running) {
                     auto waitStart = std::chrono::steady_clock::now();
@@ -223,7 +224,7 @@ int main(){
                         frame = sharedFrame.clone();
                         lastId = frameId; //받은 번호 기억
                     }
-                    auto waitEnd =  std::chrono::steady_clock::now();
+                    auto waitEnd = std::chrono::steady_clock::now();
                     waitSumMs += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
 
                     //-----------전처리-----------
@@ -275,6 +276,7 @@ int main(){
                     }
                     prevDepth = depth.clone(); //depth는 ONNX Runtime의 출력 메모리를 가르켜줄뿐이라 clone()을 해서 완전히 값을 복사해야한다
 
+                    auto emaStart = std::chrono::steady_clock::now();
                     //----------안정화 (EMA)----------
                     float a = alpha.load();     //이번 프레임에 쓸 alpa
                     if(ema.empty()) {           
@@ -288,7 +290,8 @@ int main(){
                         jsSum += cv::mean(d)[0];
                         ema = next; // 다음번에 쓸 이번출력 저장
                     }
-
+                    auto emaEnd = std::chrono::steady_clock::now();
+                    emaSum += std::chrono::duration<double, std::milli>(emaEnd - emaStart).count();
                     
                     frameCount++;
                     auto now = std::chrono::steady_clock::now();
@@ -308,12 +311,13 @@ int main(){
                         Jc = jcSum / frameCount;
                         Jg = jgSum / frameCount;
                         Js = jsSum / frameCount;
+                        emaT = emaSum / frameCount;
 
-                        std::cout << cv::format("capFps=%.0f inferFps=%.1f dispFps=%.1f wait=%.1fms  infer=%.1fms  J=%.4f  Jc=%.4f  Jg=%.4f  a=%.1f  Js=%.4f",
-                                                capFps, inferFps, dispFps, waitMs, inferMs, J, Jc, Jg, a, Js) << std::endl;
+                        std::cout << cv::format("capFps=%.0f inferFps=%.1f dispFps=%.1f wait=%.1fms  infer=%.1fms  J=%.4f  Jc=%.4f  Jg=%.4f  a=%.1f  Js=%.4f, ema=%.3f",
+                                                capFps, inferFps, dispFps, waitMs, inferMs, J, Jc, Jg, a, Js, emaT) << std::endl;
 
                         frameCount = 0;
-                        waitSumMs = inferSumMs = jSum = jcSum = jgSum = jsSum = 0;
+                        waitSumMs = inferSumMs = jSum = jcSum = jgSum = jsSum = emaSum = 0;
                         lastTime = now;  
                     }
                     
