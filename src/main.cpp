@@ -12,6 +12,8 @@
 #include <condition_variable>
 #include <algorithm>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/video.hpp>
+#include <future>
 
 void setAndCheck(cv::VideoCapture& cap, const char* label, int prop, double value) {
     bool ok = cap.set(prop, value);
@@ -44,8 +46,8 @@ struct Result {
     float a = 1.0f;
 
     double motionPct = 0;   // 움직였다고 판단한 픽셀 비율
-    bool ad = false;        // 이 결과가 s2로 만들어졌나?
     int thr = 0;            // 이 결과에 쓴 임계값
+    int mode = 0;
 };
 
 int main(){
@@ -171,8 +173,8 @@ int main(){
 
         std::atomic<float> alpha{1.0f};
 
-        std::atomic<bool> adaptive{false};  //s2 스위치
-        std::atomic<int> motionThr{15};     //움직임 임계값
+        std::atomic<int> mode{1};   // 1=s1, 2=s2, 3=s3
+        std::atomic<int> motionThr{17};     // 움직임 임계값
 
         std::thread captureThread([&]() { // 람다함수, [&] - 바깥의 변수들을 원본 그대로 쓰겠다는 뜻
             cv::Mat local;  //스레드 버퍼
@@ -228,6 +230,15 @@ int main(){
 
                 cv::Mat dilateKernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(25, 25)); //동그라미 모양 도장을 만드는 함수
                 
+                double flowSum = 0, flowT = 0, flowWaitSum = 0, flowWaitT = 0;
+                
+                cv::Mat grid(kInputH, kInputW, CV_32FC2);
+                for (int y = 0; y < grid.rows; ++y) {
+                    for (int x=0; x < grid.cols; ++x) {
+                        grid.at<cv::Vec2f>(y, x) = cv::Vec2f((float)x, (float)y);
+                    }
+                }
+
                 while(running) {
                     auto waitStart = std::chrono::steady_clock::now();
                     cv::Mat frame; //캡쳐한 최신 프레임을 추론스레드가 가져오는 역할 (복사만 빠르게)
@@ -251,7 +262,27 @@ int main(){
                     cv::Mat norm = (f32 - cv::Scalar(0.485, 0.456, 0.406)) / cv::Scalar(0.229, 0.224, 0.225);
                     //학습할때 쓴 평균/표준편차로 맞춘다 (ImageNet 기준)
                     cv::Mat blob = cv::dnn::blobFromImage(norm); // 배치순서 바꾸기(h,w,c -> p(장수), c, h, w)
+                    
+                    
+                    cv::Mat gray;
+                    cv::cvtColor(resized, gray, cv::COLOR_RGB2GRAY);
+                    // 전처리때 resized한 카메라 영상을 흑백으로
+                    // 깊이맵과의 크기가 같음
+                    int m = mode.load();  // S? (?=1, 2, 3 (모드변경)
 
+                    bool useFlow = (m == 3 && !prevGray.empty());
+                    double flowMs = 0;
+                    std::future<cv::Mat> flowJob;
+                    if (useFlow) {
+                        flowJob = std::async(std::launch::async, [&](){
+                            auto t0 = std::chrono::steady_clock::now();
+                            cv::Mat flow;
+                            cv::calcOpticalFlowFarneback(gray, prevGray, flow, 0.5, 3, 15, 3, 5, 1.2, 0);
+                            cv::Mat map = grid + flow;
+                            flowMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                            return map;
+                        });
+                    }
                     //-----------추론--------------
                     Ort::Value input = Ort::Value::CreateTensor<float>(
                         mem, blob.ptr<float>(), blob.total(), input_shape.data(), input_shape.size()); //텐서 생성(얕은 복사)
@@ -293,13 +324,8 @@ int main(){
                     auto emaStart = std::chrono::steady_clock::now();
                     //----------안정화 (EMA)----------
                     float a = alpha.load();     //이번 프레임에 쓸 alpa
-                    bool ad = adaptive.load();  //s2 켜짐?
                     int thr = motionThr.load(); //임계값
 
-                    cv::Mat gray;
-                    cv::cvtColor(resized, gray, cv::COLOR_RGB2GRAY);
-                    // 전처리때 resized한 카메라 영상을 흑백으로
-                    // 깊이맵과의 크기가 같음
 
                     cv::Mat motion = cv::Mat::zeros(gray.size(), CV_8U); //일단 전부 0으로
 
@@ -307,9 +333,27 @@ int main(){
                         ema = depth.clone();    //첫프레임은 그대로, 출력 = 원본
                     } 
                     else {
+
+                        cv::Mat ref = prevGray;
+                        cv::Mat base = ema;
+
+                        if(m == 3) {
+                            if (useFlow){
+                                auto w0 = std::chrono::steady_clock::now();
+                                cv::Mat map = flowJob.get();
+                                flowWaitSum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+                                flowSum += flowMs;
+
+                                cv::Mat warpedGray, warpedEma;
+                                cv::remap(prevGray, warpedGray, map, cv::noArray(), cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+                                cv::remap(ema, warpedEma, map, cv::noArray(), cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+                                ref = warpedGray;
+                                base = warpedEma;
+                            }
+                        }
+
                         cv::Mat diffImg;
                         cv::absdiff(gray, prevGray, diffImg); // 픽셀마다 |지금밝기 - 직전밝기|, 정지상태는 거의 0 / 움직임은 숫자가 커짐
-                        
                         motion = diffImg > thr; // 픽셀마다의 차이가 임계값보다 크면 255 아니면 0
                         
                         cv::Mat motionWide;
@@ -317,10 +361,10 @@ int main(){
                         motion = motionWide;
 
                         cv::Mat alphaMap(depth.size(), CV_32F, cv::Scalar(a)); // 깊이맵과 같은 크기의 그림을 그리고, 모든칸을 알파로 채움
-                        if (ad) alphaMap.setTo(1.0f, motion); // s2가 참일때만 motion이 255인 칸만 알파를 1.0으로 바꿈
+                        if (m >= 2) alphaMap.setTo(1.0f, motion); // s2가 참일때만 motion이 255인 칸만 알파를 1.0으로 바꿈
                         cv::blur(alphaMap, alphaMap, cv::Size(15, 15)); // 알파맵을 15x15 평균으로 흐리게 (도장 테두리 방지)
 
-                        cv::Mat next = ema + alphaMap.mul(depth - ema); // ema공식
+                        cv::Mat next = base + alphaMap.mul(depth - base); // ema공식
 
                         cv::Mat d;
                         cv::absdiff(next, ema, d); // J 안정화 구하기 ()
@@ -359,12 +403,14 @@ int main(){
                         emaT = emaSum / frameCount;
                         L = lSum / frameCount;
                         motionPct = mSum / frameCount;
+                        flowT = flowSum / frameCount;
+                        flowWaitT = flowWaitSum / frameCount;
 
-                        std::cout << cv::format("capFps=%.0f,inferFps=%.1f,dispFps=%.1f,wait=%.1fms,infer=%.1fms,J=%.4f,Jc=%.4f,Jg=%.4f,a=%.1f,Js=%.4f,ema=%.3f,L=%.3f,S2=%s,thr=%d,mot=%.1f%%", 
-                            capFps, inferFps, dispFps, waitMs, inferMs, J, Jc, Jg, a, Js, emaT, L, ad ? "on" : "off", thr, motionPct) << std::endl;
+                        std::cout << cv::format("capFps=%.0f,inferFps=%.1f,dispFps=%.1f,wait=%.1fms,infer=%.1fms,J=%.4f,Jc=%.4f,Jg=%.4f,a=%.1f,Js=%.4f,ema=%.3f,L=%.3f,S%d,flow=%.1fms,thr=%d,mot=%.1f%%,wait2=%.1fms", 
+                            capFps, inferFps, dispFps, waitMs, inferMs, J, Jc, Jg, a, Js, emaT, L, m, flowT, thr, motionPct, flowWaitT) << std::endl;
 
                         frameCount = 0;
-                        waitSumMs = inferSumMs = jSum = jcSum = jgSum = jsSum = emaSum = lSum = mSum = 0;
+                        waitSumMs = inferSumMs = jSum = jcSum = jgSum = jsSum = emaSum = lSum = mSum = flowSum = flowWaitT = 0;
                         lastTime = now;  
                     }
                     
@@ -383,8 +429,8 @@ int main(){
                         sharedResult.L = L;
 
                         sharedResult.motionPct = motionPct;
-                        sharedResult.ad = ad;
                         sharedResult.thr = thr;
+                        sharedResult.mode = mode;
 
                         resultId++;
                     }
@@ -456,7 +502,7 @@ int main(){
                 if (key >= '1' && key <= '9') alpha = (key - '0') / 10.0f;
                 if (key == '0') alpha = 1.0f;
                 if (key == 's') showStab = !showStab;
-                if (key == 'm') adaptive = !adaptive; // s1 <-> s2
+                if (key == 'm') mode = mode % 3 + 1; // 1 -> 2 -> 3
                 if (key == '[') motionThr = std::min(motionThr + 2, 255); // 임계값 올리기
                 if (key == ']') motionThr = std::max(motionThr - 2, 1);     // 내리기
             }
