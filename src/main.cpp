@@ -47,7 +47,6 @@ struct Result {
 
     double motionPct = 0;   // 움직였다고 판단한 픽셀 비율
     int thr = 0;            // 이 결과에 쓴 임계값
-    int mode = 0;
 };
 
 int main(){
@@ -215,27 +214,26 @@ int main(){
         std::thread inferThread([&]() {
             try{
                 // ---------추론 스레드에서만 쓰는 변수------
-                int lastId = 0;
-                cv::Mat prevDepth;
-                int frameCount = 0;
-                auto lastTime = std::chrono::steady_clock::now();
-                double waitSumMs = 0, inferSumMs = 0, jSum = 0, jcSum = 0, jgSum = 0;
-                double inferMs = 0, J = 0, Jc =0, Jg = 0;
+                int lastId = 0; // 마지막으로 받은 프레임 번호
+                cv::Mat prevDepth;  // 이전 깊이맵
+                int frameCount = 0; // 1초 통계내기 위한 변수
+                auto lastTime = std::chrono::steady_clock::now();   // 1초 통계내기 위한 변수
+                double waitSumMs = 0, inferSumMs = 0, jSum = 0, jcSum = 0, jgSum = 0;   // sum변수는 매 프레임마다 더해 1초동안 모으는 합계
+                double inferMs = 0, J = 0, Jc =0, Jg = 0;   // sum이 안붙은 변수는 1초 평균 (다음 1초가 끝날때까지 값 유지)
                 cv::Mat ema; //EMA의 이전 출력
                 double jsSum = 0, Js = 0;
                 double emaSum = 0, emaT = 0;
                 double L = 0, lSum = 0;
                 cv::Mat prevGray;   //직전 카메라 영상
                 double mSum = 0, motionPct = 0;
+                double flowSum = 0, flowT = 0, flowWaitSum = 0, flowWaitT = 0;
 
                 cv::Mat dilateKernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(25, 25)); //동그라미 모양 도장을 만드는 함수
                 
-                double flowSum = 0, flowT = 0, flowWaitSum = 0, flowWaitT = 0;
-                
-                cv::Mat grid(kInputH, kInputW, CV_32FC2);
+                cv::Mat grid(kInputH, kInputW, CV_32FC2);   // 칸(x, y)에 자기 좌표(x, y)를 적어서 그리기
                 for (int y = 0; y < grid.rows; ++y) {
                     for (int x=0; x < grid.cols; ++x) {
-                        grid.at<cv::Vec2f>(y, x) = cv::Vec2f((float)x, (float)y);
+                        grid.at<cv::Vec2f>(y, x) = cv::Vec2f((float)x, (float)y);   //코드 기준인 x,y를 y,x(행,열)로 바꾸기
                     }
                 }
 
@@ -246,11 +244,11 @@ int main(){
                         std::unique_lock<std::mutex> lock(frameMutex); //스레드 잠금
                         frameCv.wait(lock, [&] { return frameId != lastId || !running; }); //조건이 참이면 바로 복사, 거짓이면 잠금을 풀고 잠듬, 캡처가 신호를 보내면 다시 깨서 조건확인
                         if (!running) break; //종료중이면 루프 탈출
-                        frame = sharedFrame.clone();
+                        frame = sharedFrame.clone(); //캡쳐스레드에서 공유한 새프레임을 내가 쓸 프레임저장 공간에 복사
                         lastId = frameId; //받은 번호 기억
                     }
                     auto waitEnd = std::chrono::steady_clock::now();
-                    waitSumMs += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
+                    waitSumMs += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();    // 새 프레임을 가져오는 시간 구하기 (wait)
 
                     //-----------전처리-----------
                     cv::Mat rgb;
@@ -270,19 +268,21 @@ int main(){
                     // 깊이맵과의 크기가 같음
                     int m = mode.load();  // S? (?=1, 2, 3 (모드변경)
 
-                    bool useFlow = (m == 3 && !prevGray.empty());
-                    double flowMs = 0;
-                    std::future<cv::Mat> flowJob;
+                    bool useFlow = (m == 3 && !prevGray.empty());   // s3모드임과 동시에 전흑백프레임이 존재할경우 광학흐름(useFlow) 계산
+                    double flowMs = 0;  // 임시 스레드가 사용하는 변수 (추론 스레드는 .get()뒤에서만 읽음)
+                    std::future<cv::Mat> flowJob; // ? 영수증이 뭐지?
+
                     if (useFlow) {
-                        flowJob = std::async(std::launch::async, [&](){
+                        flowJob = std::async(std::launch::async, [&](){ // 임시 스레드 생성
                             auto t0 = std::chrono::steady_clock::now();
                             cv::Mat flow;
-                            cv::calcOpticalFlowFarneback(gray, prevGray, flow, 0.5, 3, 15, 3, 5, 1.2, 0);
-                            cv::Mat map = grid + flow;
-                            flowMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                            cv::calcOpticalFlowFarneback(gray, prevGray, flow, 0.5, 3, 15, 3, 5, 1.2, 0); // 광학 흐름 계산 (지금과 이전 결과를 비교해서 flow에 채워줌)
+                            cv::Mat map = grid + flow; // 주소 = 내 좌표 + 이동량
+                            flowMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); // 광학 흐름 계산 시간
                             return map;
                         });
                     }
+
                     //-----------추론--------------
                     Ort::Value input = Ort::Value::CreateTensor<float>(
                         mem, blob.ptr<float>(), blob.total(), input_shape.data(), input_shape.size()); //텐서 생성(얕은 복사)
@@ -301,7 +301,7 @@ int main(){
                     // =======================
                     //      흔들림 측정
                     // =======================
-                    if (!prevDepth.empty()) {
+                    if (!prevDepth.empty()) {   // 첫 프레임은 이전 깊이가 없어서 건너뛰기
                         double meanNow = cv::mean(depth)[0];        //이번 프레임 평균
                         double meanPrev = cv::mean(prevDepth)[0];   //직전 프레임 평균
 
@@ -319,7 +319,7 @@ int main(){
                         cv::absdiff(a, b, diff);
                         jcSum += cv::mean(diff)[0];
                     }
-                    prevDepth = depth.clone(); //depth는 ONNX Runtime의 출력 메모리를 가르켜줄뿐이라 clone()을 해서 완전히 값을 복사해야한다
+                    prevDepth = depth.clone(); //depth는 ONNX Runtime의 출력 메모리를 가르켜줄뿐이라 clone()을 해서 완전히 값을 복사해야한다 (깊은복사)
 
                     auto emaStart = std::chrono::steady_clock::now();
                     //----------안정화 (EMA)----------
@@ -327,37 +327,39 @@ int main(){
                     int thr = motionThr.load(); //임계값
 
 
-                    cv::Mat motion = cv::Mat::zeros(gray.size(), CV_8U); //일단 전부 0으로
+                    cv::Mat motion = cv::Mat::zeros(gray.size(), CV_8U); //첫프레임은 움직임맵 계산을 안하지만 첫 motion을 세기때문에 일단 전부 0으로 채움
 
                     if(ema.empty()) {           
                         ema = depth.clone();    //첫프레임은 그대로, 출력 = 원본
                     } 
                     else {
 
-                        cv::Mat ref = prevGray;
-                        cv::Mat base = ema;
+                        cv::Mat ref = prevGray; // 전 흑백 영상
+                        cv::Mat base = ema; // 전 출력 영상
 
                         if(m == 3) {
                             if (useFlow){
                                 auto w0 = std::chrono::steady_clock::now();
-                                cv::Mat map = flowJob.get();
-                                flowWaitSum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
-                                flowSum += flowMs;
+                                cv::Mat map = flowJob.get();    // 광학 흐름 결과를 받음 (덜 끝났으면 여기서 기다림, 두 스레드의 동기화 지점)
+                                flowWaitSum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count(); // 기다린 시간 (wait2)
+                                flowSum += flowMs; // .get 뒤라서 flowMs에 안전하게 접근 가능
 
                                 cv::Mat warpedGray, warpedEma;
-                                cv::remap(prevGray, warpedGray, map, cv::noArray(), cv::INTER_LINEAR, cv::BORDER_REPLICATE);
-                                cv::remap(ema, warpedEma, map, cv::noArray(), cv::INTER_LINEAR, cv::BORDER_REPLICATE);
-                                ref = warpedGray;
-                                base = warpedEma;
+                                cv::remap(prevGray, warpedGray, map, cv::noArray(), cv::INTER_LINEAR, cv::BORDER_REPLICATE); // 주소표대로 이전 흑백영상을 옮김
+                                cv::remap(ema, warpedEma, map, cv::noArray(), cv::INTER_LINEAR, cv::BORDER_REPLICATE); // 주소표대로 이전 출력영상을 옮김
+                                ref = warpedGray; // s3일때 ref에 옮긴 값을 넣음
+                                base = warpedEma; // s3일때 base에 옮긴 값을 넣음
                             }
                         }
 
                         cv::Mat diffImg;
-                        cv::absdiff(gray, prevGray, diffImg); // 픽셀마다 |지금밝기 - 직전밝기|, 정지상태는 거의 0 / 움직임은 숫자가 커짐
+                        cv::absdiff(gray, ref, diffImg); // 픽셀마다 |지금밝기 - 직전밝기|, 정지상태는 거의 0 / 움직임은 숫자가 커짐
                         motion = diffImg > thr; // 픽셀마다의 차이가 임계값보다 크면 255 아니면 0
                         
                         cv::Mat motionWide;
-                        cv::dilate(motion, motionWide, dilateKernel);   // 팽창
+                        cv::dilate(motion, motionWide, dilateKernel);   
+                        // dilate = 팽창 (움직임 맵을 도장 크기만큼 넓힘) 
+                        //깊이 모델을 경계를 흐릿하게 출력하기때문에 실제 움직임 맵에서는 안움직였다고 판단할 수 있기때문에 움직임 맵을 넓혀서 즉시 따라가게 함
                         motion = motionWide;
 
                         cv::Mat alphaMap(depth.size(), CV_32F, cv::Scalar(a)); // 깊이맵과 같은 크기의 그림을 그리고, 모든칸을 알파로 채움
@@ -374,28 +376,29 @@ int main(){
                         cv::absdiff(ema, depth, d);
                         lSum += cv::mean(d)[0];
                     }
-                    prevGray = gray.clone();
+                    prevGray = gray.clone(); // .get 뒤에서만 사용해야 한다 (임시스레드가 읽는 도중 바뀌면 데이터 레이스 발생 가능)
 
-                    mSum += cv::countNonZero(motion) * 100.0 / motion.total(); // 0이 아닌 칸수 / 전체 칸 수 * 100 = 움직인 비율%
+                    mSum += cv::countNonZero(motion) * 100.0 / motion.total(); // 0이 아닌 칸수 * 100 / 전체 칸 수 = 움직인 비율% (움직였다고 판단한 픽셀비율을 더함)
                     
                     auto emaEnd = std::chrono::steady_clock::now();
-                    emaSum += std::chrono::duration<double, std::milli>(emaEnd - emaStart).count();
+                    emaSum += std::chrono::duration<double, std::milli>(emaEnd - emaStart).count(); // 안정화 시간 계산
                     
 
-                    frameCount++;
-                    auto now = std::chrono::steady_clock::now();
+                    frameCount++;   // 프레임 세기
+                    auto now = std::chrono::steady_clock::now();    // 현재 시간 기록 (프레임을 센 시간)
 
                     //------------1초 통계-----------
                     double elapsed = std::chrono::duration<double>(now - lastTime).count();
                     // 시간 간격을 초단위 소수로 바꿔 단위를 빼고 숫자만 꺼내옴
                     if(elapsed >= 1.0){  //세는건 매바퀴고 경과 시간이 1초를 넘었을때 계산하고 초기화
 
-                        double capFps = captureCount.exchange(0) / elapsed;
+                        double capFps = captureCount.exchange(0) / elapsed; // 값을 읽음과 동시에 0으로 만듬
                         double dispFps = displayCount.exchange(0) / elapsed;
                         double inferFps = frameCount / elapsed;
                         double waitMs = waitSumMs / frameCount;
 
-                        inferMs = inferSumMs / frameCount;  //frameCount가 0이 되기전에 계산
+                        //frameCount가 0이 되기전에 계산 (1초동안 모은 합계 / 프레임 수)
+                        inferMs = inferSumMs / frameCount;  
                         J = jSum / frameCount;
                         Jc = jcSum / frameCount;
                         Jg = jgSum / frameCount;
@@ -408,9 +411,10 @@ int main(){
 
                         std::cout << cv::format("capFps=%.0f,inferFps=%.1f,dispFps=%.1f,wait=%.1fms,infer=%.1fms,J=%.4f,Jc=%.4f,Jg=%.4f,a=%.1f,Js=%.4f,ema=%.3f,L=%.3f,S%d,flow=%.1fms,thr=%d,mot=%.1f%%,wait2=%.1fms", 
                             capFps, inferFps, dispFps, waitMs, inferMs, J, Jc, Jg, a, Js, emaT, L, m, flowT, thr, motionPct, flowWaitT) << std::endl;
-
+                        
+                        // 다음 1초 계산을 위해 값을 0으로 초기화
                         frameCount = 0;
-                        waitSumMs = inferSumMs = jSum = jcSum = jgSum = jsSum = emaSum = lSum = mSum = flowSum = flowWaitT = 0;
+                        waitSumMs = inferSumMs = jSum = jcSum = jgSum = jsSum = emaSum = lSum = mSum = flowSum = flowWaitSum = 0;
                         lastTime = now;  
                     }
                     
@@ -430,13 +434,12 @@ int main(){
 
                         sharedResult.motionPct = motionPct;
                         sharedResult.thr = thr;
-                        sharedResult.mode = mode;
 
-                        resultId++;
+                        resultId++; // 새 결과가 들어왔다는 증표
                     }
                 }
             }
-            catch (const std::exception& e) {
+            catch (const std::exception& e) {   // 추론스레드에서 예외가 나면 running을 끄고 다른 스레드를 깨움 (예외가 스레드 밖으로 나가면 강제종료)
                 std::cerr << "Infer thread error: " << e.what() << std::endl;
                 {
                     std::lock_guard<std::mutex> lock(frameMutex);
@@ -447,7 +450,7 @@ int main(){
         });
         ThreadGuard inferGuard{inferThread, running, frameMutex, frameCv};
 
-        bool showStab = false;
+        bool showStab = false; // main만 읽고 쓰는 변수
 
         // ============================================================
         // 표시만
@@ -459,13 +462,13 @@ int main(){
                 bool fresh = false;
                 {
                     std::lock_guard<std::mutex> lock(resultMutex);
-                    if (resultId != lastResultId) {
+                    if (resultId != lastResultId) { // 새 결과가 들어왔는지 확인
                         shown = sharedResult;
-                        shown.frame = sharedResult.frame.clone();
+                        shown.frame = sharedResult.frame.clone();   // 깊은 복사로 putTxet에서 마음대로 그리기 위해 .clone()사용
                         shown.depth = sharedResult.depth.clone();
                         shown.depthStab = sharedResult.depthStab.clone();
-                        lastResultId = resultId;
-                        fresh = true;
+                        lastResultId = resultId; // 새결과 판별 번호와 이전결과 판별번호를 같게 함 (다음 결과 판별 위함)
+                        fresh = true; // 새 결과를 받았다는 표시 (루프 안에서만)
                     }
                 }
 
