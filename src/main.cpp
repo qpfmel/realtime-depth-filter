@@ -47,6 +47,8 @@ struct Result {
 
     double motionPct = 0;   // 움직였다고 판단한 픽셀 비율
     int thr = 0;            // 이 결과에 쓴 임계값
+
+    cv::Mat lag;    // 픽셀별 잔상 |출력 - 원본|
 };
 
 int main(){
@@ -329,6 +331,8 @@ int main(){
 
                     cv::Mat motion = cv::Mat::zeros(gray.size(), CV_8U); //첫프레임은 움직임맵 계산을 안하지만 첫 motion을 세기때문에 일단 전부 0으로 채움
 
+                    cv::Mat lagMap; // 첫프레임은 비어있음
+
                     if(ema.empty()) {           
                         ema = depth.clone();    //첫프레임은 그대로, 출력 = 원본
                     } 
@@ -374,6 +378,7 @@ int main(){
                         ema = next; // 다음번에 쓸 이번출력 저장
 
                         cv::absdiff(ema, depth, d);
+                        lagMap = d; // L의 평균을 내기전, 픽셀별 값 그대로
                         lSum += cv::mean(d)[0];
                     }
                     prevGray = gray.clone(); // .get 뒤에서만 사용해야 한다 (임시스레드가 읽는 도중 바뀌면 데이터 레이스 발생 가능)
@@ -435,6 +440,8 @@ int main(){
                         sharedResult.motionPct = motionPct;
                         sharedResult.thr = thr;
 
+                        sharedResult.lag = lagMap.clone();
+
                         resultId++; // 새 결과가 들어왔다는 증표
                     }
                 }
@@ -451,6 +458,7 @@ int main(){
         ThreadGuard inferGuard{inferThread, running, frameMutex, frameCv};
 
         bool showStab = false; // main만 읽고 쓰는 변수
+        bool showLag = false;
 
         // ============================================================
         // 표시만
@@ -464,6 +472,7 @@ int main(){
                     std::lock_guard<std::mutex> lock(resultMutex);
                     if (resultId != lastResultId) { // 새 결과가 들어왔는지 확인
                         shown = sharedResult;
+                        shown.lag = sharedResult.lag.clone();
                         shown.frame = sharedResult.frame.clone();   // 깊은 복사로 putTxet에서 마음대로 그리기 위해 .clone()사용
                         shown.depth = sharedResult.depth.clone();
                         shown.depthStab = sharedResult.depthStab.clone();
@@ -478,8 +487,16 @@ int main(){
                     cv::minMaxLoc(shown.depth, &mn, &mx);
 
                     cv::Mat depth_vis;
-                    const cv::Mat& toShow = showStab ? shown.depthStab : shown.depth;
-                    cv::normalize(toShow, depth_vis, 0, 255, cv::NORM_MINMAX, CV_8U);
+
+                    if (showLag && !shown.lag.empty()) {    
+                        shown.lag.convertTo(depth_vis, CV_8U, 255.0 / (0.2 * (mx - mn))); 
+                        // 고정 배율: 깊이 범위의 20% 이상 어긋나면 최대 밝기 → S2와 S3의 밝기를 직접 비교할 수 있음
+                    }
+                    else {
+                        const cv::Mat& toShow = showStab ? shown.depthStab : shown.depth;
+                        cv::normalize(toShow, depth_vis, 0, 255, cv::NORM_MINMAX, CV_8U);
+                    }
+
                     cv::Mat depth_color;
                     cv::applyColorMap(depth_vis, depth_color, cv::COLORMAP_INFERNO);
 
@@ -508,6 +525,7 @@ int main(){
                 if (key == 'm') mode = mode % 3 + 1; // 1 -> 2 -> 3
                 if (key == '[') motionThr = std::min(motionThr + 2, 255); // 임계값 올리기
                 if (key == ']') motionThr = std::max(motionThr - 2, 1);     // 내리기
+                if (key == 'v') showLag = !showLag;
             }
     }
     catch (const Ort::Exception& e) { //try catch로 실패시 원인을 파악하기 위해 사용
