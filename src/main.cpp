@@ -14,6 +14,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/video.hpp>
 #include <future>
+#include <opencv2/ximgproc.hpp>
 
 void setAndCheck(cv::VideoCapture& cap, const char* label, int prop, double value) {
     bool ok = cap.set(prop, value);
@@ -36,6 +37,28 @@ struct ThreadGuard {
     }
     
 };
+
+// guided filter: 안내자 I의 경계를 따라 p를 매끄럽게 한다
+// I = 안내자 (흑백, 0~1 float), p = 고칠 깊이, r = 창 반지름, eps = "진짜 경계" 기준
+cv::Mat guidedFilter (const cv::Mat& I, const cv::Mat& p, int r, double eps) {
+    cv::Size win(2 * r + 1, 2 * r + 1);
+    cv::Mat meanI, meanP, corrIP, corrII;
+    cv::boxFilter(I, meanI, CV_32F, win);           // 창 안의 흑백 평균
+    cv::boxFilter(p, meanP, CV_32F, win);           // 창 안의 깊이 평균
+    cv::boxFilter(I.mul(p), corrIP, CV_32F, win);   // 창 안의 (흑백X깊이) 평균
+    cv::boxFilter(I.mul(I), corrII, CV_32F, win);   // 창 안의 (흑백X흑백) 평균
+
+    cv::Mat varI = corrII - meanI.mul(meanI);   // 흑백 분산 (창 안에서 흑백이 변하는 정도)
+    cv::Mat covIP = corrIP - meanI.mul(meanP);  // 공분산: 흑백과 깊이가 얼마나 "같이" 변하나
+
+    cv::Mat a = covIP / (varI + eps);   // 직선의 기울기
+    cv::Mat b = meanP - a.mul(meanI);   // 직선의 절편
+
+    cv::Mat meanA, meanB;
+    cv::boxFilter(a, meanA, CV_32F, win);   
+    cv::boxFilter(b, meanB, CV_32F, win);
+    return meanA.mul(I) + meanB;
+}
 
 struct Result {
     cv::Mat frame;
