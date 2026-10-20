@@ -40,6 +40,7 @@ struct ThreadGuard {
 
 // guided filter: 안내자 I의 경계를 따라 p를 매끄럽게 한다
 // I = 안내자 (흑백, 0~1 float), p = 고칠 깊이, r = 창 반지름, eps = "진짜 경계" 기준
+// 이 작업은 흑백 영상이 단순히 늘어지고 옮겨진것 뿐이라서 경계위치가 뚜렷한 흑백 영상에서 가져오기때문에 결과영상의 깊이맵이 흑백영상의 뚜렷한 경계를 가질수있어
 cv::Mat guidedFilter (const cv::Mat& I, const cv::Mat& p, int r, double eps) {
     cv::Size win(2 * r + 1, 2 * r + 1);
     cv::Mat meanI, meanP, corrIP, corrII;
@@ -51,13 +52,14 @@ cv::Mat guidedFilter (const cv::Mat& I, const cv::Mat& p, int r, double eps) {
     cv::Mat varI = corrII - meanI.mul(meanI);   // 흑백 분산 (창 안에서 흑백이 변하는 정도)
     cv::Mat covIP = corrIP - meanI.mul(meanP);  // 공분산: 흑백과 깊이가 얼마나 "같이" 변하나
 
-    cv::Mat a = covIP / (varI + eps);   // 직선의 기울기
-    cv::Mat b = meanP - a.mul(meanI);   // 직선의 절편
+    cv::Mat a = covIP / (varI + eps);   // 직선의 기울기 (기울기 = 공분산 / 분산) : 결과 깊이맵의 경계면을 뚜렷하게 하기위한 장치 (흑백영상의 경계면을 빌려옴)
+    // eps가 하는일은 0나누기 방지와 a의 값이 작을경우 경계를 뚜렷하게 하기위함
+    cv::Mat b = meanP - a.mul(meanI);   // 직선의 절편 (원래 깊이맵의 값과 유사하게 높이기위한 장치)
 
-    cv::Mat meanA, meanB;
+    cv::Mat meanA, meanB;                   // 여러 창들의 직선을 평균 내서 가장 유사한 절편과 기울기를 구함
     cv::boxFilter(a, meanA, CV_32F, win);   
     cv::boxFilter(b, meanB, CV_32F, win);
-    return meanA.mul(I) + meanB;
+    return meanA.mul(I) + meanB;    // 깊이 = a × 흑백 + b
 }
 
 struct Result {
