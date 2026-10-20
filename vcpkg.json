@@ -2,6 +2,6 @@
     "name": "realtime-depth-filter",
     "version" : "0.1.0",
     "dependencies": [
-        "opencv4"
+        { "name": "opencv4", "features": ["contrib"] }
     ]
 }
