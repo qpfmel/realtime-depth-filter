@@ -202,6 +202,11 @@ int main(){
         std::atomic<int> mode{1};   // 1=s1, 2=s2, 3=s3
         std::atomic<int> motionThr{17};     // 움직임 임계값
 
+        std::atomic<int> s4Mode{0}; // s4 모드 전환 3가지 상태라 bool이 아닌 int
+        std::atomic<int> gfR{8};    // 창 반지름 R (8이면 창크기는 17X17)
+        const double kEps[] = {1e-4, 1e-3, 1e-2, 1e-1}; // eps 후보 4개
+        std::atomic<int> epsIdx{2}; // 몇번째 eps후보를 사용할지 (3번째 부터 시작)
+
         std::thread captureThread([&]() { // 람다함수, [&] - 바깥의 변수들을 원본 그대로 쓰겠다는 뜻
             cv::Mat local;  //스레드 버퍼
             while (running) {
@@ -551,6 +556,10 @@ int main(){
                 if (key == '[') motionThr = std::min(motionThr + 2, 255); // 임계값 올리기
                 if (key == ']') motionThr = std::max(motionThr - 2, 1);     // 내리기
                 if (key == 'v') showLag = !showLag;
+                if (key == 'g') s4Mode = (s4Mode + 1) % 3;  // 0, 1, 2 전환
+                if (key == '-') gfR = std::max(gfR - 2, 1);     // 창 줄이기
+                if (key == '=') gfR = std::min(gfR + 2, 32);    // 창 키우기
+                if (key == 'e') epsIdx = (epsIdx + 1) % 4;      // 0.01, 0.1, 0.0001, 0.01 전환 
             }
     }
     catch (const Ort::Exception& e) { //try catch로 실패시 원인을 파악하기 위해 사용
