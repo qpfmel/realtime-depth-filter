@@ -53,7 +53,7 @@ cv::Mat guidedFilter (const cv::Mat& I, const cv::Mat& p, int r, double eps) {
     cv::Mat covIP = corrIP - meanI.mul(meanP);  // 공분산: 흑백과 깊이가 얼마나 "같이" 변하나
 
     cv::Mat a = covIP / (varI + eps);   // 직선의 기울기 (기울기 = 공분산 / 분산) : 결과 깊이맵의 경계면을 뚜렷하게 하기위한 장치 (흑백영상의 경계면을 빌려옴)
-    // eps가 하는일은 0나누기 방지와 a의 값이 작을경우 경계를 뚜렷하게 하기위함
+    // eps = 경계로 인정하는 합격선. 크면 뿌옇게 뭉개고, 작으면 경계를 또렷하게 살림 (+ 0 나누기 방지)
     cv::Mat b = meanP - a.mul(meanI);   // 직선의 절편 (원래 깊이맵의 값과 유사하게 높이기위한 장치)
 
     cv::Mat meanA, meanB;                   // 여러 창들의 직선을 평균 내서 가장 유사한 절편과 기울기를 구함
@@ -260,6 +260,10 @@ int main(){
                 double mSum = 0, motionPct = 0;
                 double flowSum = 0, flowT = 0, flowWaitSum = 0, flowWaitT = 0;
 
+                cv::Mat prevDepthF; // 이전 프레임의 s4결과
+                double gfSum = 0, gfT = 0, jfSum = 0, Jf = 0, gfDiffSum = 0, gfDiff = 0;
+
+
                 cv::Mat dilateKernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(25, 25)); //동그라미 모양 도장을 만드는 함수
                 
                 cv::Mat grid(kInputH, kInputW, CV_32FC2);   // 칸(x, y)에 자기 좌표(x, y)를 적어서 그리기
@@ -353,6 +357,38 @@ int main(){
                     }
                     prevDepth = depth.clone(); //depth는 ONNX Runtime의 출력 메모리를 가르켜줄뿐이라 clone()을 해서 완전히 값을 복사해야한다 (깊은복사)
 
+                    //-------------s4: 경계보존--------------------------
+                    int s4 = s4Mode.load(); // 프레임을 처음 한번만 꺼냄
+                    int r = gfR.load(); // 반지름 길이 꺼냄
+                    double eps = kEps[epsIdx.load()];   // 실제 eps 값을 꺼냄
+
+                    cv::Mat depthF = depth;
+                    if (s4 != 0) {  // s4가 켜져있을때만 실행
+                        cv::Mat guide;
+                        gray.convertTo(guide, CV_32F, 1.0 / 255.0); // eps 전처리 (eps후보는 0~1기준)
+                        auto g0 = std::chrono::steady_clock::now(); // s4 비용 측정을 위한 코드
+                        if (s4 == 1) depthF = guidedFilter(guide, depth, r, eps);   // 직접 구현한 가이드 필터를 사용함
+                        else cv::ximgproc::guidedFilter(guide, depth, depthF, r, eps);  //contrib의 ximgproc 모듈 안에 있다는 뜻 직접짠 가이드필터와 구분해줌
+                        gfSum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g0).count(); // 걸린 시간을 ms로 변환해 합계를 구함
+
+                        if (s4 == 2) {  // s4가 contrib모드일때 직접구현한 함수도 한번더 돌림
+                            cv::Mat mine = guidedFilter(guide, depth, r, eps), d2;
+                            cv::absdiff(mine, depthF, d2); // 픽셀마다 |mine - contrib|를 구해 평균을 내서 비교함 (0에 가까우면 mine이 옳음)
+                            cv::Rect inner(r, r, d2.cols - 2 * r, d2.rows - 2 * r);   // 가장자리 r픽셀을 뺀 안쪽 사각형
+                            gfDiffSum += cv::mean(d2(inner))[0];                      // 안쪽만 평균
+                        }
+                    }
+
+                    if(!prevDepthF.empty()) {   // s4의 j(깊이맵 흔들림)계산
+                        cv::Mat d3;
+                        cv::absdiff(depthF, prevDepthF, d3);
+                        jfSum += cv::mean(d3)[0];
+                    }
+                    prevDepthF = depthF.clone();
+
+                    
+
+
                     auto emaStart = std::chrono::steady_clock::now();
                     //----------안정화 (EMA)----------
                     float a = alpha.load();     //이번 프레임에 쓸 alpa
@@ -364,7 +400,7 @@ int main(){
                     cv::Mat lagMap; // 첫프레임은 비어있음
 
                     if(ema.empty()) {           
-                        ema = depth.clone();    //첫프레임은 그대로, 출력 = 원본
+                        ema = depthF.clone();    //첫프레임은 그대로, 출력 = 원본
                     } 
                     else {
 
@@ -400,14 +436,14 @@ int main(){
                         if (m >= 2) alphaMap.setTo(1.0f, motion); // s2가 참일때만 motion이 255인 칸만 알파를 1.0으로 바꿈
                         cv::blur(alphaMap, alphaMap, cv::Size(15, 15)); // 알파맵을 15x15 평균으로 흐리게 (도장 테두리 방지)
 
-                        cv::Mat next = base + alphaMap.mul(depth - base); // ema공식
+                        cv::Mat next = base + alphaMap.mul(depthF - base); // ema공식
 
                         cv::Mat d;
                         cv::absdiff(next, ema, d); // J 안정화 구하기 ()
                         jsSum += cv::mean(d)[0];
                         ema = next; // 다음번에 쓸 이번출력 저장
 
-                        cv::absdiff(ema, depth, d);
+                        cv::absdiff(ema, depthF, d);
                         lagMap = d; // L의 평균을 내기전, 픽셀별 값 그대로
                         lSum += cv::mean(d)[0];
                     }
@@ -443,13 +479,20 @@ int main(){
                         motionPct = mSum / frameCount;
                         flowT = flowSum / frameCount;
                         flowWaitT = flowWaitSum / frameCount;
+                        gfT = gfSum / frameCount;  
+                        Jf = jfSum / frameCount;  
+                        gfDiff = gfDiffSum / frameCount;
 
-                        std::cout << cv::format("capFps=%.0f,inferFps=%.1f,dispFps=%.1f,wait=%.1fms,infer=%.1fms,J=%.4f,Jc=%.4f,Jg=%.4f,a=%.1f,Js=%.4f,ema=%.3f,L=%.3f,S%d,flow=%.1fms,thr=%d,mot=%.1f%%,wait2=%.1fms", 
-                            capFps, inferFps, dispFps, waitMs, inferMs, J, Jc, Jg, a, Js, emaT, L, m, flowT, thr, motionPct, flowWaitT) << std::endl;
-                        
+                        std::cout << cv::format("[speed] fps=%.1f infer=%.1f ema=%.2f flow=%.1f wait2=%.1f gf=%.2f | "
+                        "[jitter] J=%.4f Jf=%.4f Js=%.4f L=%.3f | "
+                        "[set] S%d a=%.1f thr=%d mot=%.1f%% S4=%d r=%d eps=%.4f diff=%.5f",
+                        inferFps, inferMs, emaT, flowT, flowWaitT, gfT,
+                        J, Jf, Js, L,
+                        m, a, thr, motionPct, s4, r, eps, gfDiff) << std::endl;
+
                         // 다음 1초 계산을 위해 값을 0으로 초기화
                         frameCount = 0;
-                        waitSumMs = inferSumMs = jSum = jcSum = jgSum = jsSum = emaSum = lSum = mSum = flowSum = flowWaitSum = 0;
+                        waitSumMs = inferSumMs = jSum = jcSum = jgSum = jsSum = emaSum = lSum = mSum = flowSum = flowWaitSum = gfSum = jfSum = gfDiffSum = 0;
                         lastTime = now;  
                     }
                     
@@ -457,7 +500,7 @@ int main(){
                     {   // 추론스레드가 넣고 main스레드가 꺼냄
                         std::lock_guard<std::mutex> lock(resultMutex);
                         sharedResult.frame = frame.clone();
-                        sharedResult.depth = depth.clone();
+                        sharedResult.depth = depthF.clone();
                         sharedResult.depthStab = ema.clone();
                         sharedResult.inferMs = inferMs;
                         sharedResult.J = J;
