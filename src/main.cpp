@@ -69,6 +69,26 @@ struct Sums {   // 1초동안 모으는 합계들
     double mot = 0, gfDiff = 0;     // 기타
 };
 
+struct Prep {   //전처리 결과 2개를 한번에 return하기 위한 구조체 선언
+    cv::Mat blob;   // 모델 입력 (1, 3, H, W), ImageNet 기준으로 정규화
+    cv::Mat gray;   // 같은 크기의 흑백 영상 (s2, s3, s4가 사용함)
+};
+
+Prep preprocess(const cv::Mat& frame, cv::Size size) {
+    cv::Mat rgb, resized, f32;
+    cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);    // 색 순서를 bgr에서 rgb로(OpenCV는 bgr이지만 해당 모델은 rgb여서)
+    cv::resize(rgb, resized, size);   // 모델이 14x14 조각으로 보기때문에 14배수로 진행
+    resized.convertTo(f32, CV_32F, 1.0 / 255.0); // 0~1(소수)로 숫자형식 변경
+    cv::Mat norm = (f32 - cv::Scalar(0.485, 0.456, 0.406)) / cv::Scalar(0.229, 0.224, 0.225);
+    //학습할때 쓴 평균/표준편차로 맞춘다 (ImageNet 기준)
+
+    Prep out;
+    out.blob = cv::dnn::blobFromImage(norm); // 배치순서 바꾸기(h,w,c -> p(장수), c, h, w) 
+    cv::cvtColor(resized, out.gray, cv::COLOR_RGB2GRAY);
+    // 전처리때 resized한 카메라 영상을 흑백으로, 깊이맵과의 크기가 같음
+    return out;
+}
+
 struct Result {
     cv::Mat frame;
     cv::Mat depth;      // 원본 깊이맵
@@ -293,21 +313,10 @@ int main(){
                     sum.wait += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();    // 새 프레임을 가져오는 시간 구하기 (wait)
 
                     //-----------전처리-----------
-                    cv::Mat rgb;
-                    cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);    // 색 순서를 bgr에서 rgb로(OpenCV는 bgr이지만 해당 모델은 rgb여서)
-                    cv::Mat resized;
-                    cv::resize(rgb, resized, cv::Size(kInputW, kInputH));   // 모델이 14x14 조각으로 보기때문에 14배수로 진행
-                    cv::Mat f32;
-                    resized.convertTo(f32, CV_32F, 1.0 / 255.0); // 0~1(소수)로 숫자형식 변경
-                    cv::Mat norm = (f32 - cv::Scalar(0.485, 0.456, 0.406)) / cv::Scalar(0.229, 0.224, 0.225);
-                    //학습할때 쓴 평균/표준편차로 맞춘다 (ImageNet 기준)
-                    cv::Mat blob = cv::dnn::blobFromImage(norm); // 배치순서 바꾸기(h,w,c -> p(장수), c, h, w)
-                    
-                    
-                    cv::Mat gray;
-                    cv::cvtColor(resized, gray, cv::COLOR_RGB2GRAY);
-                    // 전처리때 resized한 카메라 영상을 흑백으로
-                    // 깊이맵과의 크기가 같음
+                    Prep prep = preprocess(frame, cv::Size(kInputW, kInputH));
+                    cv::Mat blob = prep.blob;
+                    cv::Mat gray = prep.gray;
+
                     int m = mode.load();  // S? (?=1, 2, 3 (모드변경)
 
                     bool useFlow = (m == 3 && !prevGray.empty());   // s3모드임과 동시에 전흑백프레임이 존재할경우 광학흐름(useFlow) 계산
