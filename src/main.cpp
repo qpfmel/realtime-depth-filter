@@ -62,6 +62,13 @@ cv::Mat guidedFilter (const cv::Mat& I, const cv::Mat& p, int r, double eps) {
     return meanA.mul(I) + meanB;    // 깊이 = a × 흑백 + b
 }
 
+struct Sums {   // 1초동안 모으는 합계들
+    int frames = 0;     // 1초 동안 처리한 프레임 수
+    double wait = 0, infer = 0, ema = 0, flow = 0, flowWait = 0, gf = 0;   // 시간 (ms)
+    double j = 0, jc = 0, jg = 0, jf = 0, js = 0, l = 0;  // 흔들림, 잔상
+    double mot = 0, gfDiff = 0;     // 기타
+};
+
 struct Result {
     cv::Mat frame;
     cv::Mat depth;      // 원본 깊이맵
@@ -248,20 +255,19 @@ int main(){
                 // ---------추론 스레드에서만 쓰는 변수------
                 int lastId = 0; // 마지막으로 받은 프레임 번호
                 cv::Mat prevDepth;  // 이전 깊이맵
-                int frameCount = 0; // 1초 통계내기 위한 변수
                 auto lastTime = std::chrono::steady_clock::now();   // 1초 통계내기 위한 변수
-                double waitSumMs = 0, inferSumMs = 0, jSum = 0, jcSum = 0, jgSum = 0;   // sum변수는 매 프레임마다 더해 1초동안 모으는 합계
                 double inferMs = 0, J = 0, Jc =0, Jg = 0;   // sum이 안붙은 변수는 1초 평균 (다음 1초가 끝날때까지 값 유지)
                 cv::Mat ema; //EMA의 이전 출력
-                double jsSum = 0, Js = 0;
-                double emaSum = 0, emaT = 0;
-                double L = 0, lSum = 0;
+                double Js = 0;
+                double emaT = 0;
+                double L = 0;
                 cv::Mat prevGray;   //직전 카메라 영상
-                double mSum = 0, motionPct = 0;
-                double flowSum = 0, flowT = 0, flowWaitSum = 0, flowWaitT = 0;
+                double motionPct = 0;
+                double flowT = 0, flowWaitT = 0;
+                Sums sum;
 
                 cv::Mat prevDepthF; // 이전 프레임의 s4결과
-                double gfSum = 0, gfT = 0, jfSum = 0, Jf = 0, gfDiffSum = 0, gfDiff = 0;
+                double gfT = 0, Jf = 0, gfDiff = 0;
 
 
                 cv::Mat dilateKernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(25, 25)); //동그라미 모양 도장을 만드는 함수
@@ -284,7 +290,7 @@ int main(){
                         lastId = frameId; //받은 번호 기억
                     }
                     auto waitEnd = std::chrono::steady_clock::now();
-                    waitSumMs += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();    // 새 프레임을 가져오는 시간 구하기 (wait)
+                    sum.wait += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();    // 새 프레임을 가져오는 시간 구하기 (wait)
 
                     //-----------전처리-----------
                     cv::Mat rgb;
@@ -325,7 +331,7 @@ int main(){
                     auto inferStart = std::chrono::steady_clock::now(); // 추론 시작 전 시각
                     std::vector<Ort::Value> outputs = session.Run(Ort::RunOptions{nullptr}, input_names, &input, 1, output_names, 1);   // 실제 모델을 실행하는 코드
                     auto inferEnd = std::chrono::steady_clock::now(); //추론 직후 시각
-                    inferSumMs += std::chrono::duration<double, std::milli>(inferEnd - inferStart).count(); // 이번 프레임의 추론시간을 합계에 더한다 (밀리초 변환)
+                    sum.infer += std::chrono::duration<double, std::milli>(inferEnd - inferStart).count(); // 이번 프레임의 추론시간을 합계에 더한다 (밀리초 변환)
 
                     std::vector<int64_t> out_shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape(); //출력 모양 읽기
                     float* depth_data = outputs[0].GetTensorMutableData<float>(); //깊이 숫자들의 시작주소 받기
@@ -342,18 +348,18 @@ int main(){
                         double meanPrev = cv::mean(prevDepth)[0];   //직전 프레임 평균
 
                         // Jg - 통째로 밀린양. 두 평균의 차이를 직접 잰다
-                        jgSum += std::abs(meanNow - meanPrev); 
+                        sum.jg += std::abs(meanNow - meanPrev); 
 
                         // J - 전체 흔들림
                         cv::Mat diff;
                         cv::absdiff(depth, prevDepth, diff);
-                        jSum += cv::mean(diff)[0];
+                        sum.j += cv::mean(diff)[0];
 
                         // Jc - 형태변형. 각자 자기 평균을 뺀 뒤 비교 (J를 밝기 보정한 값)
                         cv::Mat a = depth - cv::Scalar(meanNow);
                         cv::Mat b = prevDepth - cv::Scalar(meanPrev);
                         cv::absdiff(a, b, diff);
-                        jcSum += cv::mean(diff)[0];
+                        sum.jc += cv::mean(diff)[0];
                     }
                     prevDepth = depth.clone(); //depth는 ONNX Runtime의 출력 메모리를 가르켜줄뿐이라 clone()을 해서 완전히 값을 복사해야한다 (깊은복사)
 
@@ -369,20 +375,20 @@ int main(){
                         auto g0 = std::chrono::steady_clock::now(); // s4 비용 측정을 위한 코드
                         if (s4 == 1) depthF = guidedFilter(guide, depth, r, eps);   // 직접 구현한 가이드 필터를 사용함
                         else cv::ximgproc::guidedFilter(guide, depth, depthF, r, eps);  //contrib의 ximgproc 모듈 안에 있다는 뜻 직접짠 가이드필터와 구분해줌
-                        gfSum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g0).count(); // 걸린 시간을 ms로 변환해 합계를 구함
+                        sum.gf += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g0).count(); // 걸린 시간을 ms로 변환해 합계를 구함
 
                         if (s4 == 2) {  // s4가 contrib모드일때 직접구현한 함수도 한번더 돌림
                             cv::Mat mine = guidedFilter(guide, depth, r, eps), d2;
                             cv::absdiff(mine, depthF, d2); // 픽셀마다 |mine - contrib|를 구해 평균을 내서 비교함 (0에 가까우면 mine이 옳음)
                             cv::Rect inner(r, r, d2.cols - 2 * r, d2.rows - 2 * r);   // 가장자리 r픽셀을 뺀 안쪽 사각형
-                            gfDiffSum += cv::mean(d2(inner))[0];                      // 안쪽만 평균
+                            sum.gfDiff += cv::mean(d2(inner))[0];                      // 안쪽만 평균
                         }
                     }
 
                     if(!prevDepthF.empty()) {   // s4의 j(깊이맵 흔들림)계산
                         cv::Mat d3;
                         cv::absdiff(depthF, prevDepthF, d3);
-                        jfSum += cv::mean(d3)[0];
+                        sum.jf += cv::mean(d3)[0];
                     }
                     prevDepthF = depthF.clone();
 
@@ -411,8 +417,8 @@ int main(){
                             if (useFlow){
                                 auto w0 = std::chrono::steady_clock::now();
                                 cv::Mat map = flowJob.get();    // 광학 흐름 결과를 받음 (덜 끝났으면 여기서 기다림, 두 스레드의 동기화 지점)
-                                flowWaitSum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count(); // 기다린 시간 (wait2)
-                                flowSum += flowMs; // .get 뒤라서 flowMs에 안전하게 접근 가능
+                                sum.flowWait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count(); // 기다린 시간 (wait2)
+                                sum.flow += flowMs; // .get 뒤라서 flowMs에 안전하게 접근 가능
 
                                 cv::Mat warpedGray, warpedEma;
                                 cv::remap(prevGray, warpedGray, map, cv::noArray(), cv::INTER_LINEAR, cv::BORDER_REPLICATE); // 주소표대로 이전 흑백영상을 옮김
@@ -440,22 +446,22 @@ int main(){
 
                         cv::Mat d;
                         cv::absdiff(next, ema, d); // J 안정화 구하기 ()
-                        jsSum += cv::mean(d)[0];
+                        sum.js += cv::mean(d)[0];
                         ema = next; // 다음번에 쓸 이번출력 저장
 
                         cv::absdiff(ema, depthF, d);
                         lagMap = d; // L의 평균을 내기전, 픽셀별 값 그대로
-                        lSum += cv::mean(d)[0];
+                        sum.l += cv::mean(d)[0];
                     }
                     prevGray = gray.clone(); // .get 뒤에서만 사용해야 한다 (임시스레드가 읽는 도중 바뀌면 데이터 레이스 발생 가능)
 
-                    mSum += cv::countNonZero(motion) * 100.0 / motion.total(); // 0이 아닌 칸수 * 100 / 전체 칸 수 = 움직인 비율% (움직였다고 판단한 픽셀비율을 더함)
+                    sum.mot += cv::countNonZero(motion) * 100.0 / motion.total(); // 0이 아닌 칸수 * 100 / 전체 칸 수 = 움직인 비율% (움직였다고 판단한 픽셀비율을 더함)
                     
                     auto emaEnd = std::chrono::steady_clock::now();
-                    emaSum += std::chrono::duration<double, std::milli>(emaEnd - emaStart).count(); // 안정화 시간 계산
+                    sum.ema += std::chrono::duration<double, std::milli>(emaEnd - emaStart).count(); // 안정화 시간 계산
                     
 
-                    frameCount++;   // 프레임 세기
+                    sum.frames++;   // 프레임 세기
                     auto now = std::chrono::steady_clock::now();    // 현재 시간 기록 (프레임을 센 시간)
 
                     //------------1초 통계-----------
@@ -465,23 +471,23 @@ int main(){
 
                         double capFps = captureCount.exchange(0) / elapsed; // 값을 읽음과 동시에 0으로 만듬
                         double dispFps = displayCount.exchange(0) / elapsed;
-                        double inferFps = frameCount / elapsed;
-                        double waitMs = waitSumMs / frameCount;
+                        double inferFps = sum.frames / elapsed;
+                        double waitMs = sum.wait / sum.frames;
 
                         //frameCount가 0이 되기전에 계산 (1초동안 모은 합계 / 프레임 수)
-                        inferMs = inferSumMs / frameCount;  
-                        J = jSum / frameCount;
-                        Jc = jcSum / frameCount;
-                        Jg = jgSum / frameCount;
-                        Js = jsSum / frameCount;
-                        emaT = emaSum / frameCount;
-                        L = lSum / frameCount;
-                        motionPct = mSum / frameCount;
-                        flowT = flowSum / frameCount;
-                        flowWaitT = flowWaitSum / frameCount;
-                        gfT = gfSum / frameCount;  
-                        Jf = jfSum / frameCount;  
-                        gfDiff = gfDiffSum / frameCount;
+                        inferMs = sum.infer / sum.frames;  
+                        J = sum.j / sum.frames;
+                        Jc = sum.jc / sum.frames;
+                        Jg = sum.jg / sum.frames;
+                        Js = sum.js / sum.frames;
+                        emaT = sum.ema / sum.frames;
+                        L = sum.l / sum.frames;
+                        motionPct = sum.mot / sum.frames;
+                        flowT = sum.flow / sum.frames;
+                        flowWaitT = sum.flowWait / sum.frames;
+                        gfT = sum.gf / sum.frames;  
+                        Jf = sum.jf / sum.frames;  
+                        gfDiff = sum.gfDiff / sum.frames;
 
                         std::cout << cv::format("[speed] fps=%.1f infer=%.1f ema=%.2f flow=%.1f wait2=%.1f gf=%.2f | "
                         "[jitter] J=%.4f Jf=%.4f Js=%.4f L=%.3f | "
@@ -491,8 +497,7 @@ int main(){
                         m, a, thr, motionPct, s4, r, eps, gfDiff) << std::endl;
 
                         // 다음 1초 계산을 위해 값을 0으로 초기화
-                        frameCount = 0;
-                        waitSumMs = inferSumMs = jSum = jcSum = jgSum = jsSum = emaSum = lSum = mSum = flowSum = flowWaitSum = gfSum = jfSum = gfDiffSum = 0;
+                        sum = {};
                         lastTime = now;  
                     }
                     
