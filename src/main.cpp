@@ -89,6 +89,12 @@ Prep preprocess(const cv::Mat& frame, cv::Size size) {
     return out;
 }
 
+double meanAbsDiff(const cv::Mat& x, const cv::Mat& y) {    // 픽셀마다 |x - y|를 구한뒤 전체 평균 값 구하기 (두 그림이 평균적으로 얼마나 다른지)
+    cv::Mat diff;
+    cv::absdiff(x, y, diff);
+    return cv::mean(diff)[0];
+}
+
 struct Result {
     cv::Mat frame;
     cv::Mat depth;      // 원본 깊이맵
@@ -360,15 +366,10 @@ int main(){
                         sum.jg += std::abs(meanNow - meanPrev); 
 
                         // J - 전체 흔들림
-                        cv::Mat diff;
-                        cv::absdiff(depth, prevDepth, diff);
-                        sum.j += cv::mean(diff)[0];
+                        sum.j += meanAbsDiff(depth, prevDepth);
 
                         // Jc - 형태변형. 각자 자기 평균을 뺀 뒤 비교 (J를 밝기 보정한 값)
-                        cv::Mat a = depth - cv::Scalar(meanNow);
-                        cv::Mat b = prevDepth - cv::Scalar(meanPrev);
-                        cv::absdiff(a, b, diff);
-                        sum.jc += cv::mean(diff)[0];
+                        sum.jc += meanAbsDiff(depth - cv::Scalar(meanNow), prevDepth - cv::Scalar(meanPrev));
                     }
                     prevDepth = depth.clone(); //depth는 ONNX Runtime의 출력 메모리를 가르켜줄뿐이라 clone()을 해서 완전히 값을 복사해야한다 (깊은복사)
 
@@ -394,11 +395,7 @@ int main(){
                         }
                     }
 
-                    if(!prevDepthF.empty()) {   // s4의 j(깊이맵 흔들림)계산
-                        cv::Mat d3;
-                        cv::absdiff(depthF, prevDepthF, d3);
-                        sum.jf += cv::mean(d3)[0];
-                    }
+                    if (!prevDepthF.empty()) sum.jf += meanAbsDiff(depthF, prevDepthF);   // Jf: S4를 거친 깊이의 흔들림
                     prevDepthF = depthF.clone();
 
                     
@@ -453,14 +450,11 @@ int main(){
 
                         cv::Mat next = base + alphaMap.mul(depthF - base); // ema공식
 
-                        cv::Mat d;
-                        cv::absdiff(next, ema, d); // J 안정화 구하기 ()
-                        sum.js += cv::mean(d)[0];
+                        sum.js += meanAbsDiff(next, ema);
                         ema = next; // 다음번에 쓸 이번출력 저장
 
-                        cv::absdiff(ema, depthF, d);
-                        lagMap = d; // L의 평균을 내기전, 픽셀별 값 그대로
-                        sum.l += cv::mean(d)[0];
+                        cv::absdiff(ema, depthF, lagMap);
+                        sum.l += cv::mean(lagMap)[0];
                     }
                     prevGray = gray.clone(); // .get 뒤에서만 사용해야 한다 (임시스레드가 읽는 도중 바뀌면 데이터 레이스 발생 가능)
 
